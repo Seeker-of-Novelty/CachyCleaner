@@ -46,3 +46,6 @@ Rewritten from scratch for the Fish shell.
     cachycleaner.fish -d -n                # preview developer cache cleanup
     cachycleaner.fish --all --dry-run      # preview everything
     cachycleaner.fish -r --paste           # report and share via paste.cachyos.org
+# Disclosure
+
+This code is given as is, you can take this code and do whatever you want to it. I would appreciate credit though, and also give credit to cscs, who make the original version of this cleaner.
