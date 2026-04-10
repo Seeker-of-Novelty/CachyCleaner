@@ -38,11 +38,11 @@ Rewritten from scratch for the Fish shell.
     No options     => runs --basic --packages --containers
     Only --dry-run => runs dry-run of --basic --packages --containers
 
-#   Config file:
+##   Config file:
     ~/.config/cachycleaner/cachycleaner.conf
 
 ###   Examples:
->    cachycleaner.fish --dry-run --list     # preview with file listing
->    cachycleaner.fish -d -n                # preview developer cache cleanup
->    cachycleaner.fish --all --dry-run      # preview everything
->    cachycleaner.fish -r --paste           # report and share via paste.cachyos.org
+    cachycleaner.fish --dry-run --list     # preview with file listing
+    cachycleaner.fish -d -n                # preview developer cache cleanup
+    cachycleaner.fish --all --dry-run      # preview everything
+    cachycleaner.fish -r --paste           # report and share via paste.cachyos.org
