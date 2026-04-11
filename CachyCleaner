@@ -1,1347 +1,1800 @@
-#!/usr/bin/env bash
+#!/usr/bin/env fish
 #
-# maclean
+# CachyCleaner for Fish Shell
+# Version: 4.0
 #
-# A script to automate safe cleaning activities for Arch/CachyOS
-# Complementary to cachy-update (handles cleaning, not updates)
+# A safe, thorough system cleaner for CachyOS / Arch Linux.
+# Designed to run interactively in Konsole (or any terminal).
 #
-# <3 cscs <3
+# Inspired by maclean (cscs).
+# Rewritten from scratch for the Fish shell.
+#
+# Safety rules:
+#   - Never touches Downloads, Documents, Desktop, Pictures, Music, Videos, etc.
+#   - Dry-run mode simulates everything without deleting a single file.
+#   - Age-based cleanup defaults to files older than 3 days.
+#   - Broken symlinks are detected and offered for removal.
+#   - Every action is explained and requires confirmation (unless --auto).
+#
+# Usage:
+#   cachycleaner.fish [options]
+#
+#   Options:
+#     -h / --help          Show this help
+#     -n / --dry-run       Simulate only — nothing is deleted
+#     -b / --basic         Run basic cleanup (cache, trash, logs, crash dumps)
+#     -p / --packages      Run package management cleanup
+#     -c / --containers    Run container cleanup (Flatpak, Snap)
+#     -j / --junk          Run custom junk directory cleanup
+#     -d / --developers    Run developer cache cleanup
+#     -k / --broken        Find and remove broken symlinks in $HOME
+#     -l / --list          List matched files before each prompt
+#     -a / --auto          Auto-confirm all prompts (cannot combine with --dry-run)
+#     -g / --aggressive    Aggressive mode (GPU caches, Steam shaders, etc.)
+#     -r / --report        Report-only mode (scan and show sizes, no prompts)
+#     --no-age / --nuke    Remove the age filter — clean ALL eligible files
+#     --paste              Upload output to paste.cachyos.org and print link
+#     --all                Run every section (basic + packages + containers + junk + dev + broken)
+#
+#   Defaults:
+#     No options     => runs --basic --packages --containers
+#     Only --dry-run => runs dry-run of --basic --packages --containers
+#
+#   Config file:
+#     ~/.config/cachycleaner/cachycleaner.conf
+#
+#   Examples:
+#     cachycleaner.fish --dry-run --list     # preview with file listing
+#     cachycleaner.fish -d -n                # preview developer cache cleanup
+#     cachycleaner.fish --all --dry-run      # preview everything
+#     cachycleaner.fish -r --paste           # report and share via paste.cachyos.org
 #
 
-set -eu
+# ═══════════════════════════════════════════════════════════════════════════════
+#  GLOBAL STATE
+# ═══════════════════════════════════════════════════════════════════════════════
 
-## Begin Script ##
+set -g SCRIPT_NAME    "CachyCleaner"
+set -g SCRIPT_VERSION "4.0"
+set -g DEFAULT_AGE_DAYS 3
+set -g DEFAULT_KEEP_VERSIONS 2
 
-EXIT_CODE=0
-_mc_dry_run=0
+set -g DRY_RUN       0
+set -g AUTO_YES      0
+set -g LIST_MATCHES  0
+set -g REPORT_ONLY   0
+set -g AGGRESSIVE    0
+set -g NO_AGE        0
+set -g PASTE_OUTPUT  0
 
-## Exit if Root ##
+set -g RUN_BASIC      0
+set -g RUN_PACKAGES   0
+set -g RUN_CONTAINERS 0
+set -g RUN_JUNK       0
+set -g RUN_DEVELOPERS 0
+set -g RUN_BROKEN     0
 
-if [[ "$EUID" = 0 ]]; then
-    echo -ne "\nPlease do not run this script as root or with sudo.\n\n"
-    exit
-fi
+set -g TOTAL_BYTES   0
+set -g SUDO_READY    0
+set -g TOOL_WORK     0
+set -g EXIT_CODE     0
 
-## Help Function ##
+set -g AGE_DAYS          $DEFAULT_AGE_DAYS
+set -g KEEP_VERSIONS     $DEFAULT_KEEP_VERSIONS
+set -g REPORT_ROWS
 
-_mc_help() {
-    echo
-    echo " maclean"
-    echo
-    echo " A script to automate safe cleaning activities"
-    echo " Complementary to cachy-update (does not perform updates)"
-    echo
-    echo " Usage: maclean [options]"
-    echo
-    echo " Options:"
-    echo "   -h     Print this Help"
-    echo "   -p     Clean only the pkg directories"
-    echo "   -j     Clean only the junk directories"
-    echo "   -d     Clean only the developer directories"
-    echo "   -c     Clean only the container directories"
-    echo "   -b     Clean only the few basic directories"
-    echo "   -a     Automatically start and affirm all Cleanings"
-    echo "   -n     Dry run: simulate all cleanings without deleting anything"
-    echo
-}
+# ═══════════════════════════════════════════════════════════════════════════════
+#  REFUSE ROOT
+# ═══════════════════════════════════════════════════════════════════════════════
 
-## Config Paths ##
+if test (id -u) -eq 0
+    echo ""
+    echo "Please run $SCRIPT_NAME as your normal user, not as root."
+    echo ""
+    exit 1
+end
 
-[[ -v XDG_CONFIG_HOME ]] && _xdg_base_config="$XDG_CONFIG_HOME" || _xdg_base_config="$HOME/.config"
-_mc_config_dir="$_xdg_base_config/maclean"
-_mc_config_file="$_mc_config_dir/maclean.conf"
-mkdir -p "$_mc_config_dir"
+# ═══════════════════════════════════════════════════════════════════════════════
+#  CONFIG FILE
+# ═══════════════════════════════════════════════════════════════════════════════
 
-## Source Generation ##
+set -g CONFIG_DIR (set -q XDG_CONFIG_HOME; and echo $XDG_CONFIG_HOME; or echo $HOME/.config)/cachycleaner
+set -g CONFIG_FILE $CONFIG_DIR/cachycleaner.conf
 
-if [[ ! -f "$_mc_config_file" ]] || ! grep -q "_mc_junk_dirs" "$_mc_config_file"; then
-    {
-        echo -ne "## maclean conf file ##\n\n"
-        echo -ne "## Directories to be considered junk. Additional folders may be added.\n## One path on each line. Please Use Caution. Targets will be deleted.\n\n"
-        echo -ne "_mc_junk_dirs=(\n\t~/.adobe\n\t~/.macromedia\n)\n"
-    } > "$_mc_config_file"
-fi
-source "$_mc_config_file"
+mkdir -p $CONFIG_DIR
 
-## Pre-scan for dry-run flag ##
+if not test -f $CONFIG_FILE
+    # Write default config
+    echo '# CachyCleaner config (fish version)
+#
+# AGE_DAYS: files older than this many days are eligible for cleanup.
+# KEEP_VERSIONS: how many pacman package versions to keep.
+#
+# JUNK_DIRS: directories whose contents (older than AGE_DAYS) may be removed.
+#   Must be under $HOME; personal dirs like Downloads are blocked.
+#
+# PROTECTED_CACHE_DIRS: top-level paths under ~/.cache to never touch.
 
-for _mc_arg in "$@"; do
-    case "$_mc_arg" in
-        -*n*) _mc_dry_run=1 ;;
-    esac
-done
+set -g AGE_DAYS 3
+set -g KEEP_VERSIONS 2
 
-## Prompt Helper ##
+set -g JUNK_DIRS \\
+    ~/.adobe \\
+    ~/.macromedia
 
-_mc_prompt() {
-    echo -ne "$1"
-    if [[ $_mc_dry_run -eq 1 ]]; then
-        echo -e "\033[0;33my (dry run)\033[0m"
+set -g PROTECTED_CACHE_DIRS
+' >$CONFIG_FILE
+end
+
+# Detect and migrate legacy bash-style config
+if test -f $CONFIG_FILE
+    if grep -q '=' $CONFIG_FILE 2>/dev/null; and not grep -q '^set ' $CONFIG_FILE 2>/dev/null
+        set -l old_config $CONFIG_FILE.bak.(date +%s)
+        cp $CONFIG_FILE $old_config
+        set -g _warn_config_migration "Config was in bash format — backed up to $old_config and regenerated."
+        # Parse legacy values before overwriting
+        set -l _legacy_age (grep -oP '(?<=CLEAN_AGE_DAYS=)\d+' $CONFIG_FILE 2>/dev/null)
+        set -l _legacy_keep (grep -oP '(?<=KEEP_PACMAN_VERSIONS=)\d+' $CONFIG_FILE 2>/dev/null)
+        # Regenerate in fish syntax
+        echo '# CachyCleaner config (fish version)
+#
+# AGE_DAYS: files older than this many days are eligible for cleanup.
+# KEEP_VERSIONS: how many pacman package versions to keep.
+#
+# JUNK_DIRS: directories whose contents (older than AGE_DAYS) may be removed.
+#   Must be under $HOME; personal dirs like Downloads are blocked.
+#
+# PROTECTED_CACHE_DIRS: top-level paths under ~/.cache to never touch.
+
+set -g AGE_DAYS '(test -n "$_legacy_age"; and echo $_legacy_age; or echo 3)'
+set -g KEEP_VERSIONS '(test -n "$_legacy_keep"; and echo $_legacy_keep; or echo 2)'
+
+set -g JUNK_DIRS \\
+    ~/.adobe \\
+    ~/.macromedia
+
+set -g PROTECTED_CACHE_DIRS
+' >$CONFIG_FILE
+    end
+end
+
+source $CONFIG_FILE 2>/dev/null
+
+# Apply defaults for anything the config didn't set
+set -q AGE_DAYS;      or set -g AGE_DAYS $DEFAULT_AGE_DAYS
+set -q KEEP_VERSIONS; or set -g KEEP_VERSIONS $DEFAULT_KEEP_VERSIONS
+set -q JUNK_DIRS;     or set -g JUNK_DIRS
+set -q PROTECTED_CACHE_DIRS; or set -g PROTECTED_CACHE_DIRS
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  UI HELPERS (colour output for Konsole / any terminal)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+set -g C_RESET  (set_color normal)
+set -g C_DIM    (set_color brblack)
+set -g C_GREEN  (set_color green)
+set -g C_YELLOW (set_color yellow)
+set -g C_RED    (set_color red)
+set -g C_CYAN   (set_color --bold cyan)
+set -g C_BOLD   (set_color --bold white)
+
+function _section --description "Print a section header"
+    echo ""
+    echo "$C_CYAN── $argv[1] ──$C_RESET"
+end
+
+function _note --description "Print a dim info line"
+    echo "$C_DIM$argv[1]$C_RESET"
+end
+
+function _warn --description "Print a yellow warning"
+    echo "$C_YELLOW$argv[1]$C_RESET"
+end
+
+function _error --description "Print a red error"
+    echo "$C_RED$argv[1]$C_RESET"
+end
+
+function _ok --description "Print a green Done"
+    echo ""
+    echo "$C_GREEN""Done$C_RESET"
+end
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  BYTE FORMATTING
+# ═══════════════════════════════════════════════════════════════════════════════
+
+function _human_bytes --description "Convert bytes to human-readable"
+    set -l b (math --scale=0 "$argv[1]" 2>/dev/null; or echo 0)
+    if test $b -lt 1024
+        printf '%d B' $b
+    else if test $b -lt 1048576
+        printf '%d KiB' (math --scale=0 "$b / 1024")
+    else if test $b -lt 1073741824
+        printf '%d MiB' (math --scale=0 "$b / 1048576")
+    else
+        printf '%.2f GiB' (math "$b / 1073741824")
+    end
+end
+
+function _add_total --description "Accumulate freed bytes"
+    set -g TOTAL_BYTES (math "$TOTAL_BYTES + $argv[1]")
+end
+
+function _add_report_row --description "Store a label|bytes row for the ranked report"
+    set -a REPORT_ROWS "$argv[2]|$argv[1]"
+end
+
+function _print_ranked_report
+    test (count $REPORT_ROWS) -eq 0; and return
+    _section 'Ranked Cleanup Opportunities'
+    # Sort descending by byte value
+    for row in (printf '%s\n' $REPORT_ROWS | sort -t'|' -nr -k1,1)
+        set -l parts (string split '|' $row)
+        printf '  %-48s %s\n' "$parts[2]" (_human_bytes $parts[1])
+    end
+    echo ""
+end
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  CONFIRMATION & SUDO
+# ═══════════════════════════════════════════════════════════════════════════════
+
+function _confirm --description "Ask the user y/N; respects DRY_RUN, AUTO_YES, REPORT_ONLY"
+    set -l prompt $argv[1]
+
+    if test $REPORT_ONLY -eq 1
+        return 1
+    end
+
+    if test $AUTO_YES -eq 1
+        printf '%s%sy (auto)%s\n' "$prompt" "$C_GREEN" "$C_RESET"
         return 0
-    fi
-    local response
-    read -r response || response=""
-    [[ $response =~ ^(yes|y|Y|Yes)$ ]]
-}
+    end
 
-## Accounting Functions ##
+    if test $DRY_RUN -eq 1
+        printf '%s%sy (dry run)%s\n' "$prompt" "$C_YELLOW" "$C_RESET"
+        return 0
+    end
 
-_mc_bytcon() {
-    local -i _bytes=$1;
-    local _label="Recovered"
-    [[ $_mc_dry_run -eq 1 ]] && _label="Would recover ~"
-    if [[ $_bytes -lt 1024 ]]; then
-        echo -e "${_label} ${_bytes}B\033[0m"
-    elif [[ $_bytes -lt 1048576 ]]; then
-        echo -e "${_label} $(( _bytes / 1024 ))KiB\033[0m"
-    elif [[ $_bytes -lt 1073741824 ]]; then
-        echo -e "${_label} $(( _bytes / 1048576 ))MiB\033[0m"
-    else
-        _bigbytes=$(awk "BEGIN {printf \"%.2f\",${_bytes}/1073741824}")
-        echo -e "${_label} ${_bigbytes}GiB\033[0m"
-    fi
-}
-
-_mc_calcfir() {
-    _mc_quicksums=$(du -scb "$@" | tail -n1)
-    _mc_quicksums=${_mc_quicksums//[^0-9]/}
-}
-
-_mc_calcsec() {
-    _mc_quicksums2=$(du -scb "$@" | tail -n1)
-    _mc_quicksums2=${_mc_quicksums2//[^0-9]/}
-}
-
-_mc_calcdif() {
-    if [[ -v _mc_quicksums[@] && -v _mc_quicksums2[@] && -n "${_mc_quicksums:-}" && -n "${_mc_quicksums2:-}" ]]; then
-        _mc_diff=$((${_mc_quicksums[@]} - ${_mc_quicksums2[@]}))
-    elif [[ $_mc_dry_run -eq 1 && -v _mc_quicksums[@] && -n "${_mc_quicksums:-}" ]]; then
-        _mc_diff=${_mc_quicksums[@]}
-    fi
-    _mc_diff=${_mc_diff:-0}
-    _mc_bigdiff+=("$_mc_diff")
-    _mc_bytcon "$_mc_diff"
-}
-
-_mc_calcttl() {
-    if [[ -v _mc_bigdiff[@] && ${#_mc_bigdiff[@]} -gt 0 ]]; then
-        _mc_tot=0
-        for _mc_numz in "${_mc_bigdiff[@]}"; do
-            _mc_tot=$((_mc_tot + ${_mc_numz:-0}))
-        done
-        if [[ $_mc_dry_run -eq 1 ]]; then
-            echo -ne "\033[0;33m\nTotal "
-        else
-            echo -ne "\033[0;32m\nTotal "
-        fi
-        _mc_bytcon "$_mc_tot" | sed 's/Recovered\|Would recover ~/&:/g'
-    fi
-}
-
-## Section Header Helper ##
-
-_mc_section() {
-    echo -e "\n\033[1;36m── $1 ──\033[0m"
-}
-
-## ==================== ##
-## Cleaning Functions    ##
-## ==================== ##
-
-## -- Basics -- ##
-
-## Junk Function ##
-
-_mc_junker() {
-    for dir in "${_mc_junk_dirs[@]}"; do
-        if [[ -d "${dir}" ]]; then
-            if _mc_prompt "\nClean up junk directories (y/N)? "; then
-                unset _mc_quicksums _mc_quicksums2
-                _mc_calcfir "${_mc_junk_dirs[@]}" >/dev/null 2>&1
-                if [[ $_mc_dry_run -eq 0 ]]; then
-                    rm -rf "${_mc_junk_dirs[@]}" >/dev/null 2>&1
-                    _mc_calcsec "${_mc_junk_dirs[@]}" >/dev/null 2>&1
-                fi
-                echo -e "\033[0;32mDone\033[0m"
-                _mc_calcdif
-            else
-                echo -e "\033[0;90mSkipped\033[0m"
-            fi
+    read -P "$prompt" reply
+    switch (string lower "$reply")
+        case y yes
             return 0
-        fi
-    done
-}
+        case '*'
+            return 1
+    end
+end
 
-## User Trash ##
+function _ensure_sudo --description "Cache sudo credentials (skip in dry-run)"
+    if test $SUDO_READY -eq 1; or test $DRY_RUN -eq 1
+        return 0
+    end
+    sudo -v
+    set -g SUDO_READY 1
+end
 
-_mc_trash() {
-    if [[ -d ~/.local/share/Trash ]] && compgen -G "$HOME/.local/share/Trash/files/*" >/dev/null 2>&1; then
-        if _mc_prompt "\nEmpty the user trash (y/N)? "; then
-            unset _mc_quicksums _mc_quicksums2
-            _mc_calcfir ~/.local/share/Trash >/dev/null 2>&1
-            if [[ $_mc_dry_run -eq 0 ]]; then
-                rm -rf ~/.local/share/Trash/{expunged,files,info}/* >/dev/null 2>&1
-                _mc_calcsec ~/.local/share/Trash >/dev/null 2>&1
-            fi
-            echo -e "\033[0;32mDone\033[0m"
-            _mc_calcdif
-        else
-            echo -e "\033[0;90mSkipped\033[0m"
-        fi
-    fi
-}
+# ═══════════════════════════════════════════════════════════════════════════════
+#  PATH SAFETY CHECKS
+# ═══════════════════════════════════════════════════════════════════════════════
 
-## Thumbnail Cache ##
+set -g FORBIDDEN_PATHS \
+    $HOME/Downloads \
+    $HOME/Documents \
+    $HOME/Desktop \
+    $HOME/Pictures \
+    $HOME/Music \
+    $HOME/Videos \
+    $HOME/Public \
+    $HOME/Templates
 
-_mc_thumbcache() {
-    if [[ -d ~/.cache/thumbnails ]]; then
-        if _mc_prompt "\nClean thumbnail cache of files not accessed for 2 weeks (y/N)? "; then
-            unset _mc_quicksums _mc_quicksums2
-            _mc_calcfir ~/.cache/thumbnails >/dev/null 2>&1
-            if [[ $_mc_dry_run -eq 0 ]]; then
-                find ~/.cache/thumbnails -mindepth 1 -type d ! \( -readable -executable \) -prune -o -type f -atime +1 -print0 -exec rm -rf {} + >/dev/null 2>&1
-                _mc_calcsec ~/.cache/thumbnails >/dev/null 2>&1
-            fi
-            echo -e "\033[0;32mDone\033[0m"
-            _mc_calcdif
-        else
-            echo -e "\033[0;90mSkipped\033[0m"
-        fi
-    fi
-}
+function _is_forbidden --description "Return 0 if path is under a personal dir"
+    set -l target (realpath -m -- $argv[1] 2>/dev/null; or echo $argv[1])
+    for fp in $FORBIDDEN_PATHS
+        set -l base (realpath -m -- $fp 2>/dev/null; or echo $fp)
+        if test "$target" = "$base"; or string match -q "$base/*" "$target"
+            return 0
+        end
+    end
+    return 1
+end
 
-## $HOME Cache ##
+function _is_protected_cache --description "Return 0 if path is user-protected"
+    set -l candidate (realpath -m -- $argv[1] 2>/dev/null; or echo $argv[1])
+    for p in $PROTECTED_CACHE_DIRS
+        set -l expanded (string replace '~' $HOME $p)
+        set -l resolved (realpath -m -- $expanded 2>/dev/null; or echo $expanded)
+        if test "$candidate" = "$resolved"; or string match -q "$resolved/*" "$candidate"
+            return 0
+        end
+    end
+    return 1
+end
 
-_mc_homecache() {
-    if _mc_prompt "\nClean \$HOME cache of files not accessed for 2 weeks (y/N)? "; then
-        _ign_dirs=(
-            ! -path '*/thumbnails/*'
-            ! -path '*/BraveSoftware/*'
-            ! -path '*/chromium/*'
-            ! -path '*/chroots/*'
-            ! -path '*/com.github.tkashkin.gamehub/*'
-            ! -path '*/falkon/*'
-            ! -path '*/flatpak/*'
-            ! -path '*/go-build/*'
-            ! -path '*/google-chrome/*'
-            ! -path '*/manjaro-tools/*'
-            ! -path '*/midori/*'
-            ! -path '*/mozilla/*'
-            ! -path '*/net.imput.helium/*'
-            ! -path '*/pacaur/*'
-            ! -path '*/pamac/*'
-            ! -path '*/paru/*'
-            ! -path '*/pikaur/*'
-            ! -path '*/pip/*'
-            ! -path '*/protonfixes/*'
-            ! -path '*/thunderbird/*'
-            ! -path '*/trizen/*'
-            ! -path '*/vivaldi/*'
-            ! -path '*/yarn/*'
-            ! -path '*/yay/*'
-        )
-        unset _mc_quicksums _mc_quicksums2
-        _mc_calcfir ~/.cache >/dev/null 2>&1
-        if [[ $_mc_dry_run -eq 0 ]]; then
-            find ~/.cache -mindepth 1 -type d ! \( -readable -executable \) -prune -o "${_ign_dirs[@]}" -type f -atime +14 -print0 -exec rm -rf {} + >/dev/null 2>&1
-            _mc_calcsec ~/.cache >/dev/null 2>&1
-        fi
-        echo -e "\033[0;32mDone\033[0m"
-        _mc_calcdif
+function _is_safe_junk_dir --description "Validate a custom junk dir is under HOME and not a sensitive root"
+    set -l target (realpath -m -- $argv[1] 2>/dev/null; or echo $argv[1])
+    set -l home_root (realpath -m -- $HOME 2>/dev/null; or echo $HOME)
+
+    # Must be under $HOME
+    string match -q "$home_root/*" "$target"; or return 1
+    test "$target" != "$home_root"; or return 1
+
+    # Block sensitive directories
+    set -l blocked \
+        $home_root/.config \
+        $home_root/.local \
+        $home_root/.ssh \
+        $home_root/.gnupg \
+        $home_root/.mozilla \
+        $home_root/.steam \
+        $home_root/.var/app
+
+    for root in $blocked
+        set -l r (realpath -m -- $root 2>/dev/null; or echo $root)
+        if test "$target" = "$r"; or string match -q "$r/*" "$target"
+            return 1
+        end
+    end
+    return 0
+end
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  GENERIC FIND HELPERS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+function _age_filter --description "Return -mtime +N args, or nothing if NO_AGE is set"
+    if test $NO_AGE -eq 1
+        # Return nothing — no age filter applied
+        return
+    end
+    echo "-mtime"
+    echo "+$AGE_DAYS"
+end
+
+# This global will be populated after option parsing (see below)
+set -g AGE_ARGS
+
+function _count_and_bytes_older --description "Count items and total bytes for files older than AGE_DAYS in a dir"
+    # Usage: _count_and_bytes_older /path
+    # Prints two lines: count, bytes
+    set -l dir $argv[1]
+    if not test -d "$dir"
+        echo 0
+        echo 0
+        return
+    end
+    set -l count 0
+    set -l bytes 0
+    for entry in (command find "$dir" -mindepth 1 -maxdepth 1 $AGE_ARGS 2>/dev/null)
+        set count (math "$count + 1")
+        set -l sz (du -sb -- "$entry" 2>/dev/null | awk '{print $1+0}')
+        set bytes (math "$bytes + $sz")
+    end
+    echo $count
+    echo $bytes
+end
+
+function _count_and_bytes_deep_older --description "Count files/links/empty-dirs older than AGE_DAYS (recursive)"
+    set -l dir $argv[1]
+    if not test -e "$dir"
+        echo 0
+        echo 0
+        return
+    end
+    set -l count 0
+    set -l bytes 0
+    # Files and links
+    set -l n (command find "$dir" -mindepth 1 '(' -type f -o -type l ')' $AGE_ARGS 2>/dev/null | wc -l | string trim)
+    set count (math "$count + $n")
+    # Empty dirs
+    set n (command find "$dir" -mindepth 1 -type d -empty $AGE_ARGS 2>/dev/null | wc -l | string trim)
+    set count (math "$count + $n")
+    # Byte sum
+    set bytes (command find "$dir" -mindepth 1 -type f $AGE_ARGS -printf '%s\n' 2>/dev/null | awk '{s+=$1} END{printf "%d", s+0}')
+    test -z "$bytes"; and set bytes 0
+    echo $count
+    echo $bytes
+end
+
+function _count_and_bytes_deep_system --description "Like _count_and_bytes_deep_older but uses sudo"
+    set -l dir $argv[1]
+    if not test -e "$dir"
+        echo 0
+        echo 0
+        return
+    end
+    set -l find_cmd
+    if test $DRY_RUN -eq 1
+        set find_cmd find
     else
-        echo -e "\033[0;90mSkipped\033[0m"
-    fi
-}
-
-## Mesa GPU Shader Cache ##
-
-_mc_mesashader() {
-    if [[ -d ~/.cache/mesa_shader_cache || -d ~/.cache/mesa_shader_cache_db ]]; then
-        if _mc_prompt "\nClean Mesa GPU shader cache (will be regenerated on use) (y/N)? "; then
-            unset _mc_quicksums _mc_quicksums2
-            _mc_calcfir ~/.cache/mesa_shader_cache ~/.cache/mesa_shader_cache_db >/dev/null 2>&1
-            if [[ $_mc_dry_run -eq 0 ]]; then
-                rm -rf ~/.cache/mesa_shader_cache ~/.cache/mesa_shader_cache_db >/dev/null 2>&1
-                _mc_calcsec ~/.cache/mesa_shader_cache ~/.cache/mesa_shader_cache_db >/dev/null 2>&1
-            fi
-            echo -e "\033[0;32mDone\033[0m"
-            _mc_calcdif
-        else
-            echo -e "\033[0;90mSkipped\033[0m"
-        fi
-    fi
-}
-
-## Application Crash Dumps ##
-
-_mc_crashdumps() {
-    local -a _crash_dirs=()
-    while IFS= read -r -d '' d; do
-        _crash_dirs+=("$d")
-    done < <(find ~/.config -maxdepth 2 -type d \( -name "Crashpad" -o -name "crash_reports" -o -name "Crash Reports" \) -print0 2>/dev/null)
-    if [[ ${#_crash_dirs[@]} -gt 0 ]]; then
-        if _mc_prompt "\nClean ${#_crash_dirs[@]} application crash dump directories (y/N)? "; then
-            unset _mc_quicksums _mc_quicksums2
-            _mc_calcfir "${_crash_dirs[@]}" >/dev/null 2>&1
-            if [[ $_mc_dry_run -eq 0 ]]; then
-                rm -rf "${_crash_dirs[@]}" >/dev/null 2>&1
-                _mc_calcsec "${_crash_dirs[@]}" >/dev/null 2>&1
-            fi
-            echo -e "\033[0;32mDone\033[0m"
-            _mc_calcdif
-        else
-            echo -e "\033[0;90mSkipped\033[0m"
-        fi
-    fi
-}
-
-## .xsession-errors ##
-
-_mc_xsessionerrs() {
-    if [[ -f ~/.xsession-errors ]]; then
-        local _size
-        _size=$(stat -c%s ~/.xsession-errors 2>/dev/null) || _size=0
-        if [[ $_size -gt 0 ]]; then
-            if _mc_prompt "\nTruncate .xsession-errors ($(( _size / 1024 ))KiB) (y/N)? "; then
-                unset _mc_quicksums _mc_quicksums2
-                _mc_quicksums=$_size
-                _mc_quicksums2=0
-                if [[ $_mc_dry_run -eq 0 ]]; then
-                    : > ~/.xsession-errors
-                fi
-                echo -e "\033[0;32mDone\033[0m"
-                _mc_calcdif
-            else
-                echo -e "\033[0;90mSkipped\033[0m"
-            fi
-        fi
-    fi
-}
-
-## Journal Logs ##
-
-_mc_journlogs() {
-    if [[ $(LANG=C journalctl --until=-2w | awk 'NR==1 {print $2; exit}') != "No" ]]; then
-        if _mc_prompt "\nClean journal of any logs older than 2 weeks (y/N)? "; then
-            unset _mc_quicksums _mc_quicksums2
-            _mc_calcfir /var/log/journal >/dev/null 2>&1
-            if [[ $_mc_dry_run -eq 0 ]]; then
-                journalctl --vacuum-time=2weeks >/dev/null 2>&1
-                _mc_calcsec /var/log/journal >/dev/null 2>&1
-            fi
-            echo -e "\033[0;32mDone\033[0m"
-            _mc_calcdif
-        else
-            echo -e "\033[0;90mSkipped\033[0m"
-        fi
-    fi
-}
-
-## Old Rotated Log Files ##
-
-_mc_rotatedlogs() {
-    local _old_log_count
-    _old_log_count=$(find /var/log -type f \( -name "*.old" -o -name "*.gz" -o -name "*.xz" -o -name "*.bz2" -o -name "*.[1-9]" -o -name "*.[1-9].gz" \) 2>/dev/null | wc -l) || _old_log_count=0
-    if [[ $_old_log_count -gt 0 ]]; then
-        if _mc_prompt "\nClean $_old_log_count old rotated log files in /var/log (y/N)? "; then
-            unset _mc_quicksums _mc_quicksums2 _mc_diff
-            _mc_diff=$(find /var/log -type f \( -name "*.old" -o -name "*.gz" -o -name "*.xz" -o -name "*.bz2" -o -name "*.[1-9]" -o -name "*.[1-9].gz" \) -printf '%s\n' 2>/dev/null | awk '{t+=$1}END{printf "%d",t+0}') || _mc_diff=0
-            if [[ $_mc_dry_run -eq 0 ]]; then
-                sudo find /var/log -type f \( -name "*.old" -o -name "*.gz" -o -name "*.xz" -o -name "*.bz2" -o -name "*.[1-9]" -o -name "*.[1-9].gz" \) -delete 2>/dev/null
-            fi
-            _mc_bigdiff+=("$_mc_diff")
-            echo -e "\033[0;32mDone\033[0m"
-            _mc_bytcon "$_mc_diff"
-        else
-            echo -e "\033[0;90mSkipped\033[0m"
-        fi
-    fi
-}
-
-## Core Dumps ##
-
-_mc_coredumps() {
-    if compgen -G "/var/lib/systemd/coredump/*" >/dev/null 2>&1 ; then
-        if _mc_prompt "\nClean up ALL existing coredumps of crashes (y/N)? "; then
-            unset _mc_quicksums _mc_quicksums2
-            _mc_calcfir /var/lib/systemd/coredump >/dev/null 2>&1
-            if [[ $_mc_dry_run -eq 0 ]]; then
-                sudo rm -rf /var/lib/systemd/coredump/* >/dev/null 2>&1
-                _mc_calcsec /var/lib/systemd/coredump >/dev/null 2>&1
-            fi
-            echo -e "\033[0;32mDone\033[0m"
-            _mc_calcdif
-        else
-            echo -e "\033[0;90mSkipped\033[0m"
-        fi
-    fi
-}
-
-## Old /var/tmp Files ##
-
-_mc_oldvartmp() {
-    local _old_tmp_count
-    _old_tmp_count=$(find /var/tmp -mindepth 1 -maxdepth 3 -type f -atime +7 2>/dev/null | wc -l) || _old_tmp_count=0
-    if [[ $_old_tmp_count -gt 0 ]]; then
-        if _mc_prompt "\nClean $_old_tmp_count old files (>7 days) in /var/tmp (y/N)? "; then
-            unset _mc_quicksums _mc_quicksums2
-            _mc_calcfir /var/tmp >/dev/null 2>&1
-            if [[ $_mc_dry_run -eq 0 ]]; then
-                sudo find /var/tmp -mindepth 1 -maxdepth 3 -type f -atime +7 -delete 2>/dev/null
-                sudo find /var/tmp -mindepth 1 -type d -empty -delete 2>/dev/null
-                _mc_calcsec /var/tmp >/dev/null 2>&1
-            fi
-            echo -e "\033[0;32mDone\033[0m"
-            _mc_calcdif
-        else
-            echo -e "\033[0;90mSkipped\033[0m"
-        fi
-    fi
-}
-
-## -- Containers -- ##
-
-## SNAP Data ##
-
-_mc_snapdata() {
-    if command -v snap >/dev/null 2>&1 ; then
-        if _mc_prompt "\nClean old and disabled SNAP revisions (y/N)? "; then
-            unset _mc_quicksums _mc_quicksums2
-            _mc_calcfir ~/.snap ~/snap /var/lib/snapd >/dev/null 2>&1
-
-            if ! systemctl is-active --quiet snapd.service && ! systemctl is-active --quiet snapd.socket; then
-                if _mc_prompt "\nStart snapd.socket to list and remove SNAPs (y/N)? "; then
-                    if [[ $_mc_dry_run -eq 0 ]]; then
-                        systemctl start snapd.socket
-                    fi
-                else
-                    echo -e "\033[0;90mSkipped\033[0m"
-                fi
-            fi
-            if [[ $_mc_dry_run -eq 0 ]]; then
-                if systemctl is-active --quiet snapd.service || systemctl is-active --quiet snapd.socket; then
-                    LANG=C snap list --all | awk '/disabled/{print $1, $3}' | while read -r snapname revision; do
-                        sudo snap remove "$snapname" --revision="$revision"
-                    done
-                    _mc_calcsec ~/.snap ~/snap /var/lib/snapd >/dev/null 2>&1
-                fi
-            fi
-            echo -e "\033[0;32mDone\033[0m"
-            _mc_calcdif
-        else
-            echo -e "\033[0;90mSkipped\033[0m"
-        fi
-    elif [[ -d ~/.snap || -d ~/snap || -d /var/lib/snapd ]]; then
-        if _mc_prompt "\nClean up ALL SNAP application data (y/N)? "; then
-            unset _mc_quicksums _mc_quicksums2
-            _mc_calcfir ~/.snap ~/snap /var/lib/snapd >/dev/null 2>&1
-            if [[ $_mc_dry_run -eq 0 ]]; then
-                if [[ -d /var/lib/snapd ]]; then
-                    sudo rm -rf /var/lib/snapd >/dev/null 2>&1
-                fi
-                rm -rf ~/.snap ~/snap >/dev/null 2>&1;
-                _mc_calcsec ~/.snap ~/snap /var/lib/snapd >/dev/null 2>&1
-            fi
-            echo -e "\033[0;32mDone\033[0m"
-            _mc_calcdif
-        else
-            echo -e "\033[0;90mSkipped\033[0m"
-        fi
-    fi
-}
-
-## Flatpak Data ##
-
-_mc_flatdata() {
-    if command -v flatpak >/dev/null 2>&1 ; then
-        if _mc_prompt "\nClean unused Flatpak REFs and application data (y/N)? "; then
-            unset _mc_quicksums _mc_quicksums2
-            _mc_calcfir ~/.local/share/flatpak /etc/flatpak/installations.d /var/lib/flatpak >/dev/null 2>&1
-
-            if [[ -d ~/.local/share/flatpak ]]; then
-                if _mc_prompt "\nClean user flatpaks (y/N)? "; then
-                    if [[ $_mc_dry_run -eq 0 ]]; then
-                        flatpak uninstall --unused --user
-                        flatpak repair --user
-                    fi
-                else
-                    echo -ne "\033[0;90mSkipped\033[0m\n"
-                fi
-            fi
-
-            if [[ -d /etc/flatpak/installations.d || -d /var/lib/flatpak ]]; then
-                if _mc_prompt "\nClean system flatpaks (y/N)? "; then
-                    if [[ $_mc_dry_run -eq 0 ]]; then
-                        flatpak uninstall --unused
-                        sudo flatpak repair
-                    fi
-                else
-                    echo -e "\033[0;90mSkipped\033[0m\n"
-                fi
-            fi
-
-            if [[ -d ~/.var/app ]]; then
-                if _mc_prompt "\nClear flatpak application data (y/N)? "; then
-                    if [[ $_mc_dry_run -eq 0 ]]; then
-                        flatpak uninstall --delete-data
-                    fi
-                else
-                    echo -e "\033[0;90mSkipped\033[0m\n"
-                fi
-            fi
-
-            if compgen -G "/var/tmp/flatpak-cache-*" >/dev/null 2>&1 ; then
-                if _mc_prompt "\nClear flatpak cache (y/N)? "; then
-                    if [[ $_mc_dry_run -eq 0 ]]; then
-                        sudo rm -rf /var/tmp/flatpak-cache-* >/dev/null 2>&1
-                    fi
-                else
-                    echo -e "\033[0;90mSkipped\033[0m\n"
-                fi
-            fi
-            if [[ $_mc_dry_run -eq 0 ]]; then
-                _mc_calcsec ~/.local/share/flatpak /etc/flatpak/installations.d /var/lib/flatpak >/dev/null 2>&1
-            fi
-            echo -e "\033[0;32mDone\033[0m"
-            _mc_calcdif
-        else
-            echo -e "\033[0;90mSkipped\033[0m"
-        fi
-    elif [[ -d ~/.var/app || -d ~/.cache/flatpak || -d /var/lib/flatpak ]] || compgen -G "$HOME/.local/share/flatpak/db/*" >/dev/null 2>&1 || compgen -G "/var/tmp/flatpak-cache-*" >/dev/null 2>&1 ; then
-        if _mc_prompt "\nClean up ALL Flatpak application data (y/N)? "; then
-            unset _mc_quicksums _mc_quicksums2
-            _mc_calcfir ~/.local/share/flatpak /etc/flatpak/installations.d /var/lib/flatpak >/dev/null 2>&1
-            if [[ $_mc_dry_run -eq 0 ]]; then
-                sudo rm -rf /var/lib/flatpak /var/tmp/flatpak-cache-* >/dev/null 2>&1
-                rm -rf ~/.var/app ~/.local/share/flatpak ~/.cache/flatpak >/dev/null 2>&1
-                _mc_calcsec ~/.local/share/flatpak /etc/flatpak/installations.d /var/lib/flatpak >/dev/null 2>&1
-            fi
-            echo -e "\033[0;32mDone\033[0m"
-            _mc_calcdif
-        else
-            echo -e "\033[0;90mSkipped\033[0m"
-        fi
-    fi
-}
-
-## Docker Cleanup ##
-
-_mc_dockerclean() {
-    if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
-        if _mc_prompt "\nClean unused Docker data (images, containers, build cache) (y/N)? "; then
-            if [[ $_mc_dry_run -eq 1 ]]; then
-                echo "Current Docker disk usage:"
-                docker system df 2>/dev/null || true
-                _mc_bigdiff+=("0")
-            else
-                docker system prune -af 2>/dev/null || true
-                docker builder prune -af 2>/dev/null || true
-            fi
-            echo -e "\033[0;32mDone\033[0m"
-        else
-            echo -e "\033[0;90mSkipped\033[0m"
-        fi
-    fi
-}
-
-## Podman Cleanup ##
-
-_mc_podmanclean() {
-    if command -v podman >/dev/null 2>&1; then
-        if _mc_prompt "\nClean unused Podman data (images, containers, build cache) (y/N)? "; then
-            if [[ $_mc_dry_run -eq 1 ]]; then
-                echo "Current Podman disk usage:"
-                podman system df 2>/dev/null || true
-                _mc_bigdiff+=("0")
-            else
-                podman system prune -af 2>/dev/null || true
-            fi
-            echo -e "\033[0;32mDone\033[0m"
-        else
-            echo -e "\033[0;90mSkipped\033[0m"
-        fi
-    fi
-}
-
-## -- Developer -- ##
-
-## Go Cache ##
-
-_mc_gocache() {
-    if command -v go >/dev/null 2>&1 ; then
-        if _mc_prompt "\nClean up the local go build cache in \$HOME (y/N)? "; then
-            unset _mc_quicksums _mc_quicksums2
-            _mc_calcfir ~/go/pkg ~/.cache/go-build >/dev/null 2>&1
-            if [[ -d ~/go/pkg && -n "$(find ~/go/pkg -mindepth 1)" ]]; then
-                if _mc_prompt "\nClean ALL module download cache as well (y/N)? "; then
-                    if [[ $_mc_dry_run -eq 0 ]]; then
-                        go clean -modcache
-                    fi
-                else
-                    echo -e "\033[0;90mSkipped\033[0m\n"
-                fi
-            fi
-            if [[ $_mc_dry_run -eq 0 ]]; then
-                go clean -cache
-                _mc_calcsec ~/go/pkg >/dev/null 2>&1
-            fi
-            echo -e "\033[0;32mDone\033[0m"
-            _mc_calcdif
-        else
-            echo -e "\033[0;90mSkipped\033[0m"
-        fi
-    elif [[ -d ~/.cache/go-build || -d ~/go ]]; then
-        if _mc_prompt "\nClean ALL go data from \$HOME (y/N)? "; then
-            unset _mc_quicksums _mc_quicksums2
-            _mc_calcfir ~/go/pkg ~/.cache/go-build >/dev/null 2>&1
-            if [[ $_mc_dry_run -eq 0 ]]; then
-                rm -rf ~/.cache/go-build >/dev/null 2>&1
-                rm -rf ~/go >/dev/null 2>&1
-                _mc_calcsec ~/go/pkg ~/.cache/go-build >/dev/null 2>&1
-            fi
-            echo -e "\033[0;32mDone\033[0m"
-            _mc_calcdif
-        else
-            echo -e "\033[0;90mSkipped\033[0m"
-        fi
-    fi
-}
-
-## Java Cache ##
-
-_mc_javacache() {
-    if [[ -d ~/.java/deployment/cache || -d ~/.config/java/deployment/cache ]]; then
-        if _mc_prompt "\nClean ALL the java cache (y/N)? "; then
-            unset _mc_quicksums _mc_quicksums2
-            _mc_calcfir ~/.java/deployment/cache ~/.config/java/deployment/cache >/dev/null 2>&1
-            if [[ $_mc_dry_run -eq 0 ]]; then
-                rm -rf ~/.java/deployment/cache >/dev/null 2>&1
-                rm -rf ~/.config/java/deployment/cache >/dev/null 2>&1
-                _mc_calcsec ~/.java/deployment/cache ~/.config/java/deployment/cache >/dev/null 2>&1
-            fi
-            echo -e "\033[0;32mDone\033[0m"
-            _mc_calcdif
-        else
-            echo -e "\033[0;90mSkipped\033[0m"
-        fi
-    fi
-}
-
-## Corepack Cache ##
-
-_mc_corepack() {
-    if command -v corepack >/dev/null 2>&1 ; then
-        if _mc_prompt "\nClean corepack cache (y/N)? "; then
-            unset _mc_quicksums _mc_quicksums2
-            _mc_calcfir ~/.cache/node/corepack >/dev/null 2>&1
-            if [[ $_mc_dry_run -eq 0 ]]; then
-                corepack cache clean ;
-                _mc_calcsec ~/.cache/node/corepack >/dev/null 2>&1
-            fi
-            echo -e "\033[0;32mDone\033[0m"
-            _mc_calcdif
-        else
-            echo -e "\033[0;90mSkipped\033[0m"
-        fi
-    elif compgen -G "$HOME/.cache/node/corepack/*" >/dev/null 2>&1; then
-        if _mc_prompt "\nClean ALL items from corepack cache (y/N)? "; then
-            unset _mc_quicksums _mc_quicksums2
-            _mc_calcfir ~/.cache/node/corepack >/dev/null 2>&1
-            if [[ $_mc_dry_run -eq 0 ]]; then
-                rm -rf ~/.cache/node/corepack/* >/dev/null 2>&1
-                _mc_calcsec ~/.cache/node/corepack >/dev/null 2>&1
-            fi
-            echo -e "\033[0;32mDone\033[0m"
-            _mc_calcdif
-        else
-            echo -e "\033[0;90mSkipped\033[0m"
-        fi
-    fi
-}
-
-## npm Cache ##
-
-_mc_npmcache() {
-    if command -v npm >/dev/null 2>&1 ; then
-        if _mc_prompt "\nClean unneeded data and verify integrity of npm packages (y/N)? "; then
-            unset _mc_quicksums _mc_quicksums2
-            _mc_calcfir ~/.npm >/dev/null 2>&1
-            if _mc_prompt "\nClean ALL data from npm cache as well (y/N)? "; then
-                if [[ $_mc_dry_run -eq 0 ]]; then
-                    npm cache clean --force
-                fi
-            else
-                echo -e "\033[0;90mSkipped\033[0m\n"
-            fi
-            if [[ $_mc_dry_run -eq 0 ]]; then
-                npm cache verify ;
-                _mc_calcsec ~/.npm >/dev/null 2>&1
-            fi
-            echo -e "\033[0;32mDone\033[0m"
-            _mc_calcdif
-        else
-            echo -e "\033[0;90mSkipped\033[0m"
-        fi
-    elif [[ -d ~/.npm ]]; then
-        if _mc_prompt "\nClean ALL items from the npm cache (y/N)? "; then
-            unset _mc_quicksums _mc_quicksums2
-            _mc_calcfir ~/.npm >/dev/null 2>&1
-            if [[ $_mc_dry_run -eq 0 ]]; then
-                rm -rf ~/.npm >/dev/null 2>&1
-                _mc_calcsec ~/.npm >/dev/null 2>&1
-            fi
-            echo -e "\033[0;32mDone\033[0m"
-            _mc_calcdif
-        else
-            echo -e "\033[0;90mSkipped\033[0m"
-        fi
-    fi
-}
-
-## Yarn Cache ##
-
-_mc_yarncache() {
-    if command -v yarn >/dev/null 2>&1 ; then
-        if _mc_prompt "\nClean the yarn cache (y/N)? "; then
-            unset _mc_quicksums _mc_quicksums2
-            _mc_calcfir ~/.cache/yarn ~/.yarncache >/dev/null 2>&1
-            if [[ $_mc_dry_run -eq 0 ]]; then
-                yarn cache clean --mirror
-                _mc_calcsec ~/.cache/yarn ~/.yarncache >/dev/null 2>&1
-            fi
-            echo -e "\033[0;32mDone\033[0m"
-            _mc_calcdif
-        else
-            echo -e "\033[0;90mSkipped\033[0m"
-        fi
-    elif [[ -d ~/.cache/yarn || -d ~/.yarncache ]]; then
-        if _mc_prompt "\nClean ALL items from the yarn cache (y/N)? "; then
-            unset _mc_quicksums _mc_quicksums2
-            _mc_calcfir ~/.cache/yarn ~/.yarncache >/dev/null 2>&1
-            if [[ $_mc_dry_run -eq 0 ]]; then
-                rm -rf ~/.cache/yarn >/dev/null 2>&1
-                rm -rf ~/.yarncache >/dev/null 2>&1
-                _mc_calcsec ~/.cache/yarn ~/.yarncache >/dev/null 2>&1
-            fi
-            echo -e "\033[0;32mDone\033[0m"
-            _mc_calcdif
-        else
-            echo -e "\033[0;90mSkipped\033[0m"
-        fi
-    fi
-}
-
-## pnpm Cache ##
-
-_mc_pnpmcache() {
-    if command -v pnpm >/dev/null 2>&1 ; then
-        if _mc_prompt "\nClean unreferenced packages from pnpm store (y/N)? "; then
-            unset _mc_quicksums _mc_quicksums2
-            _mc_calcfir $(pnpm store path) ~/.cache/pnpm >/dev/null 2>&1
-            if [[ $_mc_dry_run -eq 0 ]]; then
-                pnpm store prune
-                _mc_calcsec $(pnpm store path) ~/.cache/pnpm >/dev/null 2>&1
-            fi
-            echo -e "\033[0;32mDone\033[0m"
-            _mc_calcdif
-        else
-            echo -e "\033[0;90mSkipped\033[0m"
-        fi
-    elif [[ -d ~/.local/share/pnpm || -d ~/.cache/pnpm ]]; then
-        if _mc_prompt "\nClean ALL items from pnpm stores and cache (y/N)? "; then
-            unset _mc_quicksums _mc_quicksums2
-            _mc_calcfir ~/.local/share/pnpm ~/.cache/pnpm >/dev/null 2>&1
-            if [[ $_mc_dry_run -eq 0 ]]; then
-                rm -rf ~/.local/share/pnpm ~/.cache/pnpm >/dev/null 2>&1
-                _mc_calcsec ~/.local/share/pnpm ~/.cache/pnpm >/dev/null 2>&1
-            fi
-            echo -e "\033[0;32mDone\033[0m"
-            _mc_calcdif
-        else
-            echo -e "\033[0;90mSkipped\033[0m"
-        fi
-    fi
-}
-
-## Rust Cargo ##
-
-_mc_rustcargo() {
-    if command -v cargo >/dev/null 2>&1 ; then
-        if _mc_prompt "\nClean the rust cargo cache of all crate sources (y/N)? "; then
-            unset _mc_quicksums _mc_quicksums2
-            _mc_calcfir ~/.cargo >/dev/null 2>&1
-            if [[ $_mc_dry_run -eq 0 ]]; then
-                if cargo -Z gc clean gc >/dev/null 2>&1 || rm -rf ~/.cargo/registry/{cache,src}; then
-                    _mc_calcsec ~/.cargo >/dev/null 2>&1
-                fi
-            fi
-            echo -e "\033[0;32mDone\033[0m"
-            _mc_calcdif
-        else
-            echo -e "\033[0;90mSkipped\033[0m"
-        fi
-    elif [[ -d ~/.cargo ]]; then
-        if _mc_prompt "\nClean ALL items from the rust cargo cache (y/N)? "; then
-            unset _mc_quicksums _mc_quicksums2
-            _mc_calcfir ~/.cargo >/dev/null 2>&1
-            if [[ $_mc_dry_run -eq 0 ]]; then
-                rm -rf ~/.cargo >/dev/null 2>&1
-                _mc_calcsec ~/.cargo >/dev/null 2>&1
-            fi
-            echo -e "\033[0;32mDone\033[0m"
-            _mc_calcdif
-        else
-            echo -e "\033[0;90mSkipped\033[0m"
-        fi
-    fi
-}
-
-## Rustup Toolchain ##
-
-_mc_rustup() {
-    if ! command -v rustup >/dev/null 2>&1 && [[ -d ~/.rustup ]]; then
-        if _mc_prompt "\nClean up leftover rustup toolchain directory (y/N)? "; then
-            unset _mc_quicksums _mc_quicksums2
-            _mc_calcfir ~/.rustup >/dev/null 2>&1
-            if [[ $_mc_dry_run -eq 0 ]]; then
-                rm -rf ~/.rustup >/dev/null 2>&1
-                _mc_calcsec ~/.rustup >/dev/null 2>&1
-            fi
-            echo -e "\033[0;32mDone\033[0m"
-            _mc_calcdif
-        else
-            echo -e "\033[0;90mSkipped\033[0m"
-        fi
-    fi
-}
-
-## Ruby Gems ##
-
-_mc_rubygems() {
-    if command -v gem >/dev/null 2>&1 && [[ -d ~/.local/share/gem ]] ; then
-        if _mc_prompt "\nClean up old versions of local user ruby gems (y/N)? "; then
-            unset _mc_quicksums _mc_quicksums2
-            _mc_calcfir ~/.local/share/gem >/dev/null 2>&1
-            if _mc_prompt "\nClean sources data from gem cache as well (y/N)? "; then
-                if [[ $_mc_dry_run -eq 0 ]]; then
-                    gem sources -c
-                fi
-            else
-                echo -e "\033[0;90mSkipped\033[0m\n"
-            fi
-            if [[ $_mc_dry_run -eq 0 ]]; then
-                gem cleanup
-                _mc_calcsec ~/.local/share/gem >/dev/null 2>&1
-            fi
-            echo -e "\033[0;32mDone\033[0m"
-            _mc_calcdif
-        else
-            echo -e "\033[0;90mSkipped\033[0m"
-        fi
-    elif [[ -d ~/.local/share/gem ]]; then
-        if _mc_prompt "\nClean up ALL local user ruby gems and data (y/N)? "; then
-            unset _mc_quicksums _mc_quicksums2
-            _mc_calcfir ~/.local/share/gem >/dev/null 2>&1
-            if [[ $_mc_dry_run -eq 0 ]]; then
-                rm -rf ~/.local/share/gem >/dev/null 2>&1
-                _mc_calcsec ~/.local/share/gem >/dev/null 2>&1
-            fi
-            echo -e "\033[0;32mDone\033[0m"
-            _mc_calcdif
-        else
-            echo -e "\033[0;90mSkipped\033[0m"
-        fi
-    fi
-}
-
-## pip Cache ##
-
-_mc_pipcache() {
-    if command -v pip >/dev/null 2>&1 ; then
-        if _mc_prompt "\nClean ALL items from the pip cache (y/N)? "; then
-            unset _mc_quicksums _mc_quicksums2
-            _mc_calcfir ~/.cache/pip >/dev/null 2>&1
-            if [[ $_mc_dry_run -eq 0 ]]; then
-                pip cache purge
-                _mc_calcsec ~/.cache/pip >/dev/null 2>&1
-            fi
-            echo -e "\033[0;32mDone\033[0m"
-            _mc_calcdif
-        else
-            echo -e "\033[0;90mSkipped\033[0m"
-        fi
-    elif [[ -d ~/.cache/pip ]]; then
-        if _mc_prompt "\nClean ALL items from the pip cache (y/N)? "; then
-            unset _mc_quicksums _mc_quicksums2
-            _mc_calcfir ~/.cache/pip >/dev/null 2>&1
-            if [[ $_mc_dry_run -eq 0 ]]; then
-                rm -rf ~/.cache/pip >/dev/null 2>&1
-                _mc_calcsec ~/.cache/pip >/dev/null 2>&1
-            fi
-            echo -e "\033[0;32mDone\033[0m"
-            _mc_calcdif
-        else
-            echo -e "\033[0;90mSkipped\033[0m"
-        fi
-    fi
-}
-
-## Python __pycache__ ##
-
-_mc_pycache() {
-    local _pyc_size
-    _pyc_size=$(find ~ -maxdepth 6 -type d -name "__pycache__" -exec du -scb {} + 2>/dev/null | tail -n1) || true
-    _pyc_size=${_pyc_size//[^0-9]/}
-    _pyc_size=${_pyc_size:-0}
-    if [[ $_pyc_size -gt 0 ]]; then
-        if _mc_prompt "\nClean Python __pycache__ directories in \$HOME (y/N)? "; then
-            unset _mc_quicksums _mc_quicksums2 _mc_diff
-            _mc_diff=$_pyc_size
-            if [[ $_mc_dry_run -eq 0 ]]; then
-                find ~ -maxdepth 6 -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
-            fi
-            _mc_bigdiff+=("$_mc_diff")
-            echo -e "\033[0;32mDone\033[0m"
-            _mc_bytcon "$_mc_diff"
-        else
-            echo -e "\033[0;90mSkipped\033[0m"
-        fi
-    fi
-}
-
-## Gradle Cache ##
-
-_mc_gradlecache() {
-    if [[ -d ~/.gradle/caches ]]; then
-        if _mc_prompt "\nClean Gradle download cache (y/N)? "; then
-            unset _mc_quicksums _mc_quicksums2
-            _mc_calcfir ~/.gradle/caches >/dev/null 2>&1
-            if [[ $_mc_dry_run -eq 0 ]]; then
-                rm -rf ~/.gradle/caches >/dev/null 2>&1
-                _mc_calcsec ~/.gradle/caches >/dev/null 2>&1
-            fi
-            echo -e "\033[0;32mDone\033[0m"
-            _mc_calcdif
-        else
-            echo -e "\033[0;90mSkipped\033[0m"
-        fi
-    fi
-}
-
-## Maven Cache ##
-
-_mc_mavencache() {
-    if [[ -d ~/.m2/repository ]]; then
-        if _mc_prompt "\nClean Maven local repository cache (y/N)? "; then
-            unset _mc_quicksums _mc_quicksums2
-            _mc_calcfir ~/.m2/repository >/dev/null 2>&1
-            if [[ $_mc_dry_run -eq 0 ]]; then
-                rm -rf ~/.m2/repository >/dev/null 2>&1
-                _mc_calcsec ~/.m2/repository >/dev/null 2>&1
-            fi
-            echo -e "\033[0;32mDone\033[0m"
-            _mc_calcdif
-        else
-            echo -e "\033[0;90mSkipped\033[0m"
-        fi
-    fi
-}
-
-## ccache ##
-
-_mc_ccachecache() {
-    if command -v ccache >/dev/null 2>&1 ; then
-        if _mc_prompt "\nClean the ccache compilation cache (y/N)? "; then
-            unset _mc_quicksums _mc_quicksums2
-            _mc_calcfir ~/.cache/ccache ~/.ccache >/dev/null 2>&1
-            if [[ $_mc_dry_run -eq 0 ]]; then
-                ccache -C >/dev/null 2>&1
-                _mc_calcsec ~/.cache/ccache ~/.ccache >/dev/null 2>&1
-            fi
-            echo -e "\033[0;32mDone\033[0m"
-            _mc_calcdif
-        else
-            echo -e "\033[0;90mSkipped\033[0m"
-        fi
-    elif [[ -d ~/.cache/ccache || -d ~/.ccache ]]; then
-        if _mc_prompt "\nClean ALL items from ccache directory (y/N)? "; then
-            unset _mc_quicksums _mc_quicksums2
-            _mc_calcfir ~/.cache/ccache ~/.ccache >/dev/null 2>&1
-            if [[ $_mc_dry_run -eq 0 ]]; then
-                rm -rf ~/.cache/ccache ~/.ccache >/dev/null 2>&1
-                _mc_calcsec ~/.cache/ccache ~/.ccache >/dev/null 2>&1
-            fi
-            echo -e "\033[0;32mDone\033[0m"
-            _mc_calcdif
-        else
-            echo -e "\033[0;90mSkipped\033[0m"
-        fi
-    fi
-}
-
-## -- Packages -- ##
-
-## pkgfile Data ##
-
-_mc_pkgfiledata() {
-    if ! command -v pkgfile >/dev/null 2>&1 && [[ -d /var/cache/pkgfile ]] ; then
-        if _mc_prompt "\nClean ALL items from the pkgfile cache (y/N)? "; then
-            unset _mc_quicksums _mc_quicksums2
-            _mc_calcfir /var/cache/pkgfile >/dev/null 2>&1
-            if [[ $_mc_dry_run -eq 0 ]]; then
-                sudo rm -rf /var/cache/pkgfile >/dev/null 2>&1
-                _mc_calcsec /var/cache/pkgfile >/dev/null 2>&1
-            fi
-            echo -e "\033[0;32mDone\033[0m"
-            _mc_calcdif
-        else
-            echo -e "\033[0;90mSkipped\033[0m"
-        fi
-    fi
-}
-
-## PackageKit Data ##
-
-_mc_packagekitdata() {
-    if command -v pkcon >/dev/null 2>&1 ; then
-        if _mc_prompt "\nClean ALL items from the PackageKit cache (y/N)? "; then
-            unset _mc_quicksums _mc_quicksums2
-            _mc_calcfir /var/cache/PackageKit /var/lib/PackageKit >/dev/null 2>&1
-            if [[ $_mc_dry_run -eq 0 ]]; then
-                sudo rm -rf /var/cache/PackageKit >/dev/null 2>&1
-                sudo pkcon refresh force -c -1
-                _mc_calcsec /var/cache/PackageKit /var/lib/PackageKit >/dev/null 2>&1
-            fi
-            echo -e "\033[0;32mDone\033[0m"
-            _mc_calcdif
-        else
-            echo -e "\033[0;90mSkipped\033[0m"
-        fi
-    elif [[ -d /var/cache/PackageKit || -d /var/lib/PackageKit ]]; then
-        if _mc_prompt "\nClean up PackageKit cache and ALL data (y/N)? "; then
-            unset _mc_quicksums _mc_quicksums2
-            _mc_calcfir /var/cache/PackageKit /var/lib/PackageKit >/dev/null 2>&1
-            if [[ $_mc_dry_run -eq 0 ]]; then
-                sudo rm -rf /var/{cache,lib}/PackageKit >/dev/null 2>&1
-                _mc_calcsec /var/cache/PackageKit /var/lib/PackageKit >/dev/null 2>&1
-            fi
-            echo -e "\033[0;32mDone\033[0m"
-            _mc_calcdif
-        else
-            echo -e "\033[0;90mSkipped\033[0m"
-        fi
-    fi
-}
-
-## Pamac Data ##
-
-_mc_pamacdata() {
-    if ! command -v pamac >/dev/null 2>&1 && [[ -d /var/tmp/pamac || -d /var/tmp/pamac-build-"$USER" ]]; then
-        if _mc_prompt "\nClean up leftover Pamac temporary files (y/N)? "; then
-            unset _mc_quicksums _mc_quicksums2
-            _mc_calcfir /var/tmp/pamac /var/tmp/pamac-build-"$USER" >/dev/null 2>&1
-            if [[ $_mc_dry_run -eq 0 ]]; then
-                sudo rm -rf /var/tmp/pamac /var/tmp/pamac-build-"$USER" >/dev/null 2>&1
-                _mc_calcsec /var/tmp/pamac /var/tmp/pamac-build-"$USER" >/dev/null 2>&1
-            fi
-            echo -e "\033[0;32mDone\033[0m"
-            _mc_calcdif
-        else
-            echo -e "\033[0;90mSkipped\033[0m"
-        fi
-    fi
-}
-
-## AUR Helper Cache(s) ##
-
-_mc_aurhelpers() {
-    if _mc_prompt "\nClean AUR Helper cache of ALL diff and package build files (y/N)? "; then
-        _helpers=(
-            pacaur
-            pamac
-            paru
-            pikaur
-            trizen
-            yay
-        )
-        unset _mc_quicksums _mc_quicksums2
-        _mc_calcfir ~/.cache/pacaur ~/.cache/paru ~/.cache/pikaur ~/.cache/trizen ~/.cache/yay /var/tmp/pamac-build-"$USER" >/dev/null 2>&1
-        if [[ $_mc_dry_run -eq 0 ]]; then
-            for _ahelper in "${_helpers[@]}"; do
-                if command -v "$_ahelper" >/dev/null 2>&1 ; then
-                    if [[ $_ahelper = "paru" ]]; then
-                        yes | LC_ALL=C $_ahelper -Sccda >/dev/null 2>&1
-                    elif [[ $_ahelper = "pacaur" || $_ahelper = "pikaur" || $_ahelper = "trizen" || $_ahelper = "yay" ]]; then
-                        yes | LC_ALL=C $_ahelper -Scca >/dev/null 2>&1
-                    elif [[ $_ahelper = "pamac" ]]; then
-                        yes | LC_ALL=C $_ahelper clean -b >/dev/null 2>&1
-                    fi
-                fi
-            done
-            _mc_calcsec ~/.cache/pacaur ~/.cache/paru ~/.cache/pikaur ~/.cache/trizen ~/.cache/yay /var/tmp/pamac-build-"$USER" >/dev/null 2>&1
-        fi
-        echo -e "\033[0;32mDone\033[0m"
-        _mc_calcdif
+        set find_cmd sudo find
+    end
+    set -l count 0
+    set -l bytes 0
+    set -l n (command $find_cmd "$dir" -mindepth 1 '(' -type f -o -type l ')' $AGE_ARGS 2>/dev/null | wc -l | string trim)
+    set count (math "$count + $n")
+    set n (command $find_cmd "$dir" -mindepth 1 -type d -empty $AGE_ARGS 2>/dev/null | wc -l | string trim)
+    set count (math "$count + $n")
+    set bytes (command $find_cmd "$dir" -mindepth 1 -type f $AGE_ARGS -printf '%s\n' 2>/dev/null | awk '{s+=$1} END{printf "%d", s+0}')
+    test -z "$bytes"; and set bytes 0
+    echo $count
+    echo $bytes
+end
+
+function _remove_old_files --description "Delete old files/links/empty-dirs from a user dir"
+    set -l dir $argv[1]
+    test -e "$dir"; or return
+    command find "$dir" -mindepth 1 '(' -type f -o -type l ')' $AGE_ARGS -delete 2>/dev/null
+    command find "$dir" -mindepth 1 -type d -empty $AGE_ARGS -delete 2>/dev/null
+end
+
+function _remove_old_system_files --description "Delete old files/links/empty-dirs from a system dir (sudo)"
+    set -l dir $argv[1]
+    test -e "$dir"; or return
+    command sudo find "$dir" -mindepth 1 '(' -type f -o -type l ')' $AGE_ARGS -delete 2>/dev/null
+    command sudo find "$dir" -mindepth 1 -type d -empty $AGE_ARGS -delete 2>/dev/null
+end
+
+function _print_preview --description "Show item count and size for a cleanup target"
+    set -l label $argv[1]
+    set -l count $argv[2]
+    set -l bytes $argv[3]
+    if test $count -eq 0
+        _note "$label: nothing eligible"
     else
-        echo -e "\033[0;90mSkipped\033[0m"
-    fi
-}
+        echo "$C_DIM$label$C_RESET: $count item(s), "(_human_bytes $bytes)
+        _add_report_row "$label" "$bytes"
+    end
+end
 
-## Package Cache and Repos ##
+# ═══════════════════════════════════════════════════════════════════════════════
+#  GENERIC MULTI-DIR CLEANER
+# ═══════════════════════════════════════════════════════════════════════════════
 
-## Pacman Unused ##
+function _clean_user_dirs --description "Clean old files from one or more user directories"
+    # Usage: _clean_user_dirs "Label" "Prompt (y/N)? " dir1 [dir2 ...]
+    set -l label $argv[1]
+    set -l prompt $argv[2]
+    set -l dirs $argv[3..]
 
-_mc_pacmanunused() {
-    if _mc_prompt "\nClean cache of uninstalled packages and unused repositories (y/N)? "; then
-        unset _mc_quicksums _mc_quicksums2
-        _mc_calcfir /var/cache/pacman /var/lib/pacman >/dev/null 2>&1
-        if [[ $_mc_dry_run -eq 0 ]]; then
-            yes | LC_ALL=C sudo pacman -Sc >/dev/null 2>&1
-            _mc_calcsec /var/cache/pacman /var/lib/pacman  >/dev/null 2>&1
-        fi
-        echo -e "\033[0;32mDone\033[0m"
-        _mc_calcdif
+    set -l total_count 0
+    set -l total_bytes 0
+
+    for dir in $dirs
+        test -e "$dir"; or continue
+        set -l stats (_count_and_bytes_deep_older "$dir")
+        set total_count (math "$total_count + $stats[1]")
+        set total_bytes (math "$total_bytes + $stats[2]")
+    end
+
+    test $total_count -gt 0; or return
+
+    _print_preview "$label" $total_count $total_bytes
+
+    if test $LIST_MATCHES -eq 1
+        for dir in $dirs
+            test -e "$dir"; or continue
+            command find "$dir" -mindepth 1 '(' -type f -o -type l ')' $AGE_ARGS -print 2>/dev/null
+            command find "$dir" -mindepth 1 -type d -empty $AGE_ARGS -print 2>/dev/null
+        end
+    end
+
+    if _confirm "$prompt"
+        if test $DRY_RUN -eq 1
+            _note "Would remove eligible items from: $dirs"
+        else
+            for dir in $dirs
+                test -e "$dir"; or continue
+                _remove_old_files "$dir"
+            end
+            _ok
+        end
+        _add_total $total_bytes
     else
-        echo -e "\033[0;90mSkipped\033[0m"
-    fi
-}
+        _note "Skipped"
+    end
+end
 
-## Pacman Cache ##
+# ═══════════════════════════════════════════════════════════════════════════════
+#  REPORT: TOP SPACE HOGS
+# ═══════════════════════════════════════════════════════════════════════════════
 
-_mc_pacmancache() {
-    if command -v paccache >/dev/null 2>&1 && [[ $(LANG=C paccache -dk2 | awk 'NR==1 {print $2; exit}') != "no" ]]; then
-        if _mc_prompt "\nClean installed package cache of all but 2 latest instances (y/N)? "; then
-            unset _mc_quicksums _mc_quicksums2
-            _mc_calcfir /var/cache/pacman/pkg >/dev/null 2>&1
-            if [[ $_mc_dry_run -eq 0 ]]; then
-                paccache -rvk2
-                _mc_calcsec /var/cache/pacman/pkg >/dev/null 2>&1
-            fi
-            echo -e "\033[0;32mDone\033[0m"
-            _mc_calcdif
+function _report_top_space_hogs
+    _section 'Largest Likely Cleanup Targets'
+    set -l targets \
+        $HOME/.cache \
+        $HOME/.local/share/Trash/files \
+        /var/cache/pacman/pkg \
+        /var/lib/flatpak \
+        $HOME/.local/share/flatpak \
+        $HOME/.local/share/Steam \
+        $HOME/.steam/root
+
+    set -l found 0
+    for p in $targets
+        test -e "$p"; or continue
+        set -l resolved (realpath -e -- "$p" 2>/dev/null; or echo $p)
+        set -l sz (du -shL -- "$resolved" 2>/dev/null | awk '{print $1}')
+        test -z "$sz"; and continue
+        printf '  %-40s %s\n' "$p" "$sz"
+        set found 1
+    end
+    if test $found -eq 0
+        _note "No reportable targets found."
+    end
+end
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  BASIC CLEANUP ACTIONS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+function _clean_trash
+    set -l trash_files $HOME/.local/share/Trash/files
+    set -l trash_info $HOME/.local/share/Trash/info
+    test -d "$trash_files"; or return
+
+    set -l stats (_count_and_bytes_older "$trash_files")
+    set -l count $stats[1]
+    set -l bytes $stats[2]
+    test $count -gt 0; or return
+
+    _print_preview "User trash $AGE_LABEL" $count $bytes
+
+    if test $LIST_MATCHES -eq 1
+        command find "$trash_files" -mindepth 1 -maxdepth 1 $AGE_ARGS -print 2>/dev/null
+    end
+
+    if _confirm "Delete trash entries $AGE_LABEL (y/N)? "
+        if test $DRY_RUN -eq 1
+            _note "Would remove old trash entries"
         else
-            echo -e "\033[0;90mSkipped\033[0m"
-        fi
-    fi
-}
+            for entry in (command find "$trash_files" -mindepth 1 -maxdepth 1 $AGE_ARGS -print0 2>/dev/null | string split0)
+                set -l base (basename -- "$entry")
+                rm -rf -- "$entry"
+                rm -f -- "$trash_info/$base.trashinfo"
+            end
+            _ok
+        end
+        _add_total $bytes
+    else
+        _note "Skipped"
+    end
+end
 
-## Pacman Orphans ##
+function _clean_thumbnails
+    _clean_user_dirs \
+        "Thumbnail cache $AGE_LABEL" \
+        "Delete thumbnail cache entries $AGE_LABEL (y/N)? " \
+        $HOME/.cache/thumbnails
+end
 
-_mc_orphans() {
-    if [[ $(pacman -Qdtq | head -c1 | wc -c) != 0 ]]; then
-        if _mc_prompt "\nClean out all orphan packages (y/N)? "; then
-            echo -ne "\nThe following will be uninstalled:\n$(pacman -Qdtq | pacman -Rsp -)\n"
+function _clean_generic_home_cache
+    set -l root $HOME/.cache
+    test -d "$root"; or return
 
-            if _mc_prompt "\nContinue with removal (y/N)? "; then
-                unset _mc_diff _mc_quicksums _mc_quicksums2
-                if [[ $_mc_dry_run -eq 0 ]]; then
-                    read -r _mc_diff < <(pacman -Qdtq | LANG=C sudo pacman -Rns --noconfirm - | tee | awk '/Total Removed/ { print int($4*1048576) }') || EXIT_CODE=$? ;
-                else
-                    _mc_diff=$(pacman -Qdtq | xargs -r pacman -Qi 2>/dev/null | awk '/^Installed Size/ {
-                        size = $4; unit = $5
-                        if (unit ~ /KiB/) size *= 1024
-                        else if (unit ~ /MiB/) size *= 1048576
-                        else if (unit ~ /GiB/) size *= 1073741824
-                        total += size
-                    } END { printf "%d", total + 0 }') || _mc_diff=0
-                fi
-                echo -e "\033[0;32mDone\033[0m"
-                _mc_calcdif
+    # Dirs to skip (handled separately or by other sections)
+    set -l skip_names thumbnails mesa_shader_cache mesa_shader_cache_db yay paru pacaur pikaur trizen pamac
+
+    set -l total_count 0
+    set -l total_bytes 0
+
+    for top in (command find "$root" -mindepth 1 -maxdepth 1 -print 2>/dev/null)
+        set -l name (basename -- "$top")
+        if contains -- "$name" $skip_names
+            continue
+        end
+        if _is_protected_cache "$top"
+            continue
+        end
+        set -l stats (_count_and_bytes_deep_older "$top")
+        set total_count (math "$total_count + $stats[1]")
+        set total_bytes (math "$total_bytes + $stats[2]")
+    end
+
+    test $total_count -gt 0; or return
+    _print_preview "Generic ~/.cache cleanup $AGE_LABEL" $total_count $total_bytes
+
+    if test $LIST_MATCHES -eq 1
+        for top in (command find "$root" -mindepth 1 -maxdepth 1 -print 2>/dev/null)
+            set -l name (basename -- "$top")
+            contains -- "$name" $skip_names; and continue
+            _is_protected_cache "$top"; and continue
+            command find "$top" -mindepth 1 '(' -type f -o -type l ')' $AGE_ARGS -print 2>/dev/null
+        end
+    end
+
+    if _confirm "Delete generic ~/.cache entries $AGE_LABEL (y/N)? "
+        if test $DRY_RUN -eq 1
+            _note "Would remove eligible ~/.cache entries"
+        else
+            for top in (command find "$root" -mindepth 1 -maxdepth 1 -print 2>/dev/null)
+                set -l name (basename -- "$top")
+                contains -- "$name" $skip_names; and continue
+                _is_protected_cache "$top"; and continue
+                _remove_old_files "$top"
+            end
+            _ok
+        end
+        _add_total $total_bytes
+    else
+        _note "Skipped"
+    end
+end
+
+function _clean_mesa_shader_cache
+    _clean_user_dirs \
+        "Mesa shader cache $AGE_LABEL" \
+        "Delete Mesa shader cache entries $AGE_LABEL (y/N)? " \
+        $HOME/.cache/mesa_shader_cache \
+        $HOME/.cache/mesa_shader_cache_db
+end
+
+function _clean_appimage_leftovers
+    _clean_user_dirs \
+        "AppImage cache $AGE_LABEL" \
+        "Delete old AppImage cache entries (y/N)? " \
+        $HOME/.cache/appimagekit
+end
+
+function _clean_crash_dumps
+    set -l crash_dirs (command find $HOME/.config -maxdepth 3 -type d '(' -name Crashpad -o -name crash_reports -o -name 'Crash Reports' ')' 2>/dev/null)
+    test (count $crash_dirs) -gt 0; or return
+
+    set -l total_count 0
+    set -l total_bytes 0
+    for dir in $crash_dirs
+        set -l stats (_count_and_bytes_deep_older "$dir")
+        set total_count (math "$total_count + $stats[1]")
+        set total_bytes (math "$total_bytes + $stats[2]")
+    end
+    test $total_count -gt 0; or return
+
+    _print_preview "Crash dump files $AGE_LABEL" $total_count $total_bytes
+
+    if test $LIST_MATCHES -eq 1
+        for dir in $crash_dirs
+            command find "$dir" -mindepth 1 '(' -type f -o -type l ')' $AGE_ARGS -print 2>/dev/null
+        end
+    end
+
+    if _confirm "Delete crash dump files $AGE_LABEL (y/N)? "
+        if test $DRY_RUN -eq 1
+            _note "Would remove old crash dump files"
+        else
+            for dir in $crash_dirs
+                _remove_old_files "$dir"
+            end
+            _ok
+        end
+        _add_total $total_bytes
+    else
+        _note "Skipped"
+    end
+end
+
+function _clean_xsession_errors
+    set -l file $HOME/.xsession-errors
+    test -f "$file"; or return
+
+    set -l sz (stat -c '%s' -- "$file" 2>/dev/null; or echo 0)
+    test $sz -gt 0; or return
+
+    # Age check (skip when --no-age)
+    if test $NO_AGE -eq 0
+        set -l mtime (stat -c '%Y' -- "$file" 2>/dev/null; or echo 0)
+        set -l cutoff (math (date +%s)" - ($AGE_DAYS * 86400)")
+        test $mtime -lt $cutoff; or return
+    end
+
+    _print_preview ".xsession-errors truncate" 1 $sz
+
+    if _confirm "Truncate .xsession-errors (y/N)? "
+        if test $DRY_RUN -eq 1
+            _note "Would truncate ~/.xsession-errors"
+        else
+            echo -n "" >$file
+            _ok
+        end
+        _add_total $sz
+    else
+        _note "Skipped"
+    end
+end
+
+function _clean_journal_logs
+    set -g TOOL_WORK 1
+    command -q journalctl; or return
+
+    set -l usage (journalctl --disk-usage 2>/dev/null)
+    test -n "$usage"; and _note "Current journal usage: $usage"
+
+    set -l journal_label
+    set -l journal_args
+    if test $NO_AGE -eq 1
+        set journal_label "Vacuum ALL journal logs"
+        set journal_args --vacuum-time=1s
+    else
+        set journal_label "Vacuum journal logs $AGE_LABEL"
+        set journal_args --vacuum-time="$AGE_DAYS"d
+    end
+
+    if _confirm "$journal_label (y/N)? "
+        if test $DRY_RUN -eq 1
+            _note "Would run: sudo journalctl --rotate $journal_args"
+        else
+            _ensure_sudo
+            echo ""
+            sudo journalctl --rotate $journal_args
+            _ok
+        end
+    else
+        _note "Skipped"
+    end
+end
+
+function _clean_rotated_logs
+    _ensure_sudo
+
+    # Build the find command as an argument list to avoid Fish glob expansion.
+    # Fish expands *.old etc. against CWD; we must quote them for find.
+    set -l find_cmd
+    if test $DRY_RUN -eq 1
+        set find_cmd find
+    else
+        set find_cmd sudo find
+    end
+
+    set -l name_args \
+        -type f '(' \
+        -name '*.old' -o \
+        -name '*.gz' -o \
+        -name '*.xz' -o \
+        -name '*.bz2' -o \
+        -name '*.[1-9]' -o \
+        -name '*.[1-9].gz' \
+        ')' $AGE_ARGS
+
+    set -l count (command $find_cmd /var/log $name_args 2>/dev/null | wc -l | string trim)
+    set -l bytes (command $find_cmd /var/log $name_args -printf '%s\n' 2>/dev/null | awk '{s+=$1} END{printf "%d", s+0}')
+    test -z "$bytes"; and set bytes 0
+    test $count -gt 0; or return
+
+    _print_preview "/var/log rotated logs $AGE_LABEL" $count $bytes
+
+    if test $LIST_MATCHES -eq 1
+        command $find_cmd /var/log $name_args -print 2>/dev/null
+    end
+
+    if _confirm "Delete rotated logs $AGE_LABEL from /var/log (y/N)? "
+        if test $DRY_RUN -eq 1
+            _note "Would remove old rotated logs from /var/log"
+        else
+            command sudo find /var/log $name_args -delete 2>/dev/null
+            _ok
+        end
+        _add_total $bytes
+    else
+        _note "Skipped"
+    end
+end
+
+function _clean_coredumps
+    set -l dir /var/lib/systemd/coredump
+    test -d "$dir"; or return
+    _ensure_sudo
+
+    set -l stats (_count_and_bytes_deep_system "$dir")
+    set -l count $stats[1]
+    set -l bytes $stats[2]
+    test $count -gt 0; or return
+
+    _print_preview "systemd coredumps $AGE_LABEL" $count $bytes
+
+    if _confirm "Delete coredump files $AGE_LABEL (y/N)? "
+        if test $DRY_RUN -eq 1
+            _note "Would remove old coredump files"
+        else
+            _remove_old_system_files "$dir"
+            _ok
+        end
+        _add_total $bytes
+    else
+        _note "Skipped"
+    end
+end
+
+function _clean_var_tmp
+    set -l dir /var/tmp
+    test -d "$dir"; or return
+    _ensure_sudo
+
+    set -l stats (_count_and_bytes_deep_system "$dir")
+    set -l count $stats[1]
+    set -l bytes $stats[2]
+    test $count -gt 0; or return
+
+    _print_preview "/var/tmp entries $AGE_LABEL" $count $bytes
+
+    if _confirm "Delete /var/tmp files $AGE_LABEL (y/N)? "
+        if test $DRY_RUN -eq 1
+            _note "Would clean old /var/tmp entries"
+        else
+            _remove_old_system_files "$dir"
+            _ok
+        end
+        _add_total $bytes
+    else
+        _note "Skipped"
+    end
+end
+
+# Aggressive-mode extras
+function _clean_electron_gpu_caches
+    _clean_user_dirs \
+        "Electron GPU caches $AGE_LABEL" \
+        "Delete old Electron GPU cache entries (y/N)? " \
+        $HOME/.config/BraveSoftware/Brave-Browser/Default/GPUCache \
+        $HOME/.config/BraveSoftware/Brave-Browser/ShaderCache \
+        $HOME/.config/obsidian/GPUCache \
+        $HOME/.config/obsidian/ShaderCache \
+        $HOME/.config/Code/GPUCache
+end
+
+function _clean_steam_shader_cache
+    set -l shader_dir $HOME/.steam/steam/steamapps/shadercache
+    test -d "$shader_dir"; or return
+
+    set -l count (command find "$shader_dir" -mindepth 1 -maxdepth 1 $AGE_ARGS 2>/dev/null | wc -l | string trim)
+    set -l bytes (command find "$shader_dir" -mindepth 1 -maxdepth 1 $AGE_ARGS -exec du -sb -- '{}' + 2>/dev/null | awk '{s+=$1} END{printf "%d", s+0}')
+    test -z "$bytes"; and set bytes 0
+    test $count -gt 0; or return
+
+    _print_preview "Steam shader cache $AGE_LABEL" $count $bytes
+    _note "Safe target: shader/transient caches only, not save data."
+
+    if _confirm "Delete old Steam shader caches (y/N)? "
+        if test $DRY_RUN -eq 1
+            _note "Would remove old Steam shader caches"
+        else
+            command find "$shader_dir" -mindepth 1 -maxdepth 1 $AGE_ARGS -exec rm -rf -- '{}' + 2>/dev/null
+            _ok
+        end
+        _add_total $bytes
+    else
+        _note "Skipped"
+    end
+end
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  BROKEN SYMLINK FINDER (deep system scan)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+function _clean_broken_symlinks
+    _note "Scanning \$HOME for broken symlinks (this may take a moment)..."
+    _note "Excluding: Steam runtime, Flatpak sandboxes, browser singletons, Trash, .cache"
+
+    set -l broken_links (command find $HOME -xtype l \
+        -not -path "$HOME/.local/share/Trash/*" \
+        -not -path "$HOME/.local/share/Steam/*" \
+        -not -path "$HOME/.steam/*" \
+        -not -path "$HOME/.cache/*" \
+        -not -path "$HOME/.var/app/*" \
+        -not -path "$HOME/.zoom/*" \
+        -not -name 'SingletonLock' \
+        -not -name 'SingletonCookie' \
+        -not -name 'SingletonSocket' \
+        2>/dev/null)
+
+    set -l count (count $broken_links)
+    if test $count -eq 0
+        _note "No broken symlinks found."
+        return
+    end
+
+    set -l total_bytes 0
+    echo "$C_BOLD""Found $count broken symlink(s):$C_RESET"
+
+    if test $LIST_MATCHES -eq 1; or test $count -le 20
+        for link in $broken_links
+            set -l target (readlink -- "$link" 2>/dev/null; or echo "???")
+            printf '  %s → %s (broken)\n' "$link" "$target"
+        end
+    else
+        # Show first 10 and last 5
+        for i in (seq 1 10)
+            set -l link $broken_links[$i]
+            set -l target (readlink -- "$link" 2>/dev/null; or echo "???")
+            printf '  %s → %s (broken)\n' "$link" "$target"
+        end
+        echo "  ... and "(math "$count - 15")" more ..."
+        for i in (seq (math "$count - 4") $count)
+            set -l link $broken_links[$i]
+            set -l target (readlink -- "$link" 2>/dev/null; or echo "???")
+            printf '  %s → %s (broken)\n' "$link" "$target"
+        end
+    end
+
+    if _confirm "Remove all $count broken symlink(s) (y/N)? "
+        if test $DRY_RUN -eq 1
+            _note "Would remove $count broken symlinks"
+        else
+            for link in $broken_links
+                rm -f -- "$link" 2>/dev/null
+            end
+            _ok
+        end
+    else
+        _note "Skipped"
+    end
+end
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  CUSTOM JUNK DIRECTORY CLEANUP
+# ═══════════════════════════════════════════════════════════════════════════════
+
+function _clean_custom_junk
+    for raw in $JUNK_DIRS
+        test -n "$raw"; or continue
+        set -l dir (string replace '~' $HOME $raw)
+        set dir (realpath -m -- "$dir" 2>/dev/null; or echo $dir)
+
+        if not _is_safe_junk_dir "$dir"
+            _warn "Skipping unsafe custom junk path: $dir"
+            continue
+        end
+        if _is_forbidden "$dir"
+            _warn "Skipping forbidden path: $dir"
+            continue
+        end
+        test -e "$dir"; or continue
+
+        set -l stats (_count_and_bytes_deep_older "$dir")
+        set -l count $stats[1]
+        set -l bytes $stats[2]
+        test $count -gt 0; or continue
+
+        _print_preview "Custom junk: $dir" $count $bytes
+
+        if test $LIST_MATCHES -eq 1
+            command find "$dir" -mindepth 1 '(' -type f -o -type l ')' $AGE_ARGS -print 2>/dev/null
+        end
+
+        if _confirm "Delete old contents from $dir (y/N)? "
+            if test $DRY_RUN -eq 1
+                _note "Would delete old contents from $dir"
             else
-                echo -e "\033[0;90mSkipped\033[0m"
-            fi
+                _remove_old_files "$dir"
+                _ok
+            end
+            _add_total $bytes
         else
-            echo -e "\033[0;90mSkipped\033[0m"
-        fi
-    fi
-}
+            _note "Skipped"
+        end
+    end
+end
 
-## Pacman Crumbs ##
+# ═══════════════════════════════════════════════════════════════════════════════
+#  DEVELOPER CACHE CLEANUP
+# ═══════════════════════════════════════════════════════════════════════════════
 
-_mc_pacmancrumbs() {
-    if compgen -G "/var/cache/pacman/pkg/download-*" >/dev/null 2>&1 && [[ ! -e /var/lib/pacman/db.lck ]]; then
-        if _mc_prompt "\nClean out pacman sandbox and interrupted download directories (y/N)? "; then
-            echo -ne "\nThe following will be deleted:\n$(find /var/cache/pacman/pkg/ -maxdepth 1 -type d ! -name '*.*' -name "download-*")\n"
+function _clean_go_cache
+    _clean_user_dirs \
+        "Go build/module cache $AGE_LABEL" \
+        "Delete old Go build/module cache entries (y/N)? " \
+        $HOME/.cache/go-build \
+        $HOME/go/pkg/mod/cache \
+        $HOME/go/pkg/sumdb
+end
 
-            if _mc_prompt "\nContinue with removal (y/N)? "; then
-                unset _mc_quicksums _mc_quicksums2 _mc_diff
-                _mc_diff=$(du -scb /var/cache/pacman/pkg/download-* 2>/dev/null | tail -n1)
-                _mc_diff=${_mc_diff//[^0-9]/}
-                _mc_diff=${_mc_diff:-0}
-                if [[ $_mc_dry_run -eq 0 ]]; then
-                    find /var/cache/pacman/pkg/ -maxdepth 1 -type d ! -name '*.*' -name "download-*" -exec sudo rm -rf {} + >/dev/null 2>&1
-                fi
-                echo -e "\033[0;32mDone\033[0m"
-                _mc_calcdif
+function _clean_java_cache
+    _clean_user_dirs \
+        "Java deployment cache $AGE_LABEL" \
+        "Delete old Java deployment cache entries (y/N)? " \
+        $HOME/.java/deployment/cache \
+        $HOME/.config/java/deployment/cache
+end
+
+function _clean_corepack_cache
+    _clean_user_dirs \
+        "Corepack cache $AGE_LABEL" \
+        "Delete old Corepack cache entries (y/N)? " \
+        $HOME/.cache/node/corepack
+end
+
+function _clean_npm_cache
+    _clean_user_dirs \
+        "npm cache/logs $AGE_LABEL" \
+        "Delete old npm cache/log entries (y/N)? " \
+        $HOME/.npm/_cacache \
+        $HOME/.npm/_logs
+end
+
+function _clean_yarn_cache
+    _clean_user_dirs \
+        "Yarn cache $AGE_LABEL" \
+        "Delete old Yarn cache entries (y/N)? " \
+        $HOME/.cache/yarn \
+        $HOME/.yarncache \
+        $HOME/.yarn/berry/cache
+end
+
+function _clean_pnpm_cache
+    _clean_user_dirs \
+        "pnpm cache $AGE_LABEL" \
+        "Delete old pnpm cache entries (y/N)? " \
+        $HOME/.cache/pnpm \
+        $HOME/.local/share/pnpm/store
+end
+
+function _clean_cargo_cache
+    _clean_user_dirs \
+        "Cargo registry/git cache $AGE_LABEL" \
+        "Delete old Cargo registry/git cache entries (y/N)? " \
+        $HOME/.cargo/registry/cache \
+        $HOME/.cargo/registry/index \
+        $HOME/.cargo/registry/src \
+        $HOME/.cargo/git/checkouts \
+        $HOME/.cargo/git/db
+end
+
+function _clean_pip_cache
+    _clean_user_dirs \
+        "pip cache $AGE_LABEL" \
+        "Delete old pip cache entries (y/N)? " \
+        $HOME/.cache/pip
+end
+
+function _clean_python_bytecode
+    set -l total_count 0
+    set -l total_bytes 0
+
+    # Standard cache dirs
+    for dir in $HOME/.cache/uv $HOME/.cache/pip-tools $HOME/.pyenv/cache
+        test -e "$dir"; or continue
+        set -l stats (_count_and_bytes_deep_older "$dir")
+        set total_count (math "$total_count + $stats[1]")
+        set total_bytes (math "$total_bytes + $stats[2]")
+    end
+
+    # __pycache__ directories under $HOME
+    set -l prune_args "-path $HOME/.local/share/Trash -o -path $HOME/.steam -o -path $HOME/.cache -o -path $HOME/.cargo -o -path $HOME/go"
+    set -l pyc_count (command find $HOME '(' -path "$HOME/.local/share/Trash" -o -path "$HOME/.steam" -o -path "$HOME/.cache" -o -path "$HOME/.cargo" -o -path "$HOME/go" ')' -prune -o -type d -name __pycache__ $AGE_ARGS -print 2>/dev/null | wc -l | string trim)
+    set -l pyc_bytes (command find $HOME '(' -path "$HOME/.local/share/Trash" -o -path "$HOME/.steam" -o -path "$HOME/.cache" -o -path "$HOME/.cargo" -o -path "$HOME/go" ')' -prune -o -type d -name __pycache__ $AGE_ARGS -exec du -sb -- '{}' + 2>/dev/null | awk '{s+=$1} END{printf "%d", s+0}')
+    test -z "$pyc_bytes"; and set pyc_bytes 0
+
+    set total_count (math "$total_count + $pyc_count")
+    set total_bytes (math "$total_bytes + $pyc_bytes")
+
+    test $total_count -gt 0; or return
+    _print_preview "Python caches $AGE_LABEL" $total_count $total_bytes
+
+    if _confirm "Delete old Python caches and __pycache__ directories (y/N)? "
+        if test $DRY_RUN -eq 1
+            _note "Would remove old Python caches and __pycache__ directories"
+        else
+            for dir in $HOME/.cache/uv $HOME/.cache/pip-tools $HOME/.pyenv/cache
+                test -e "$dir"; or continue
+                _remove_old_files "$dir"
+            end
+            command find $HOME '(' -path "$HOME/.local/share/Trash" -o -path "$HOME/.steam" -o -path "$HOME/.cache" -o -path "$HOME/.cargo" -o -path "$HOME/go" ')' -prune -o -type d -name __pycache__ $AGE_ARGS -exec rm -rf -- '{}' + 2>/dev/null
+            _ok
+        end
+        _add_total $total_bytes
+    else
+        _note "Skipped"
+    end
+end
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  CONTAINER CLEANUP (Flatpak / Snap)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+function _clean_flatpak
+    set -g TOOL_WORK 1
+
+    if command -q flatpak
+        if _confirm "Remove unused Flatpak refs (user) (y/N)? "
+            if test $DRY_RUN -eq 1
+                _note "Would run: flatpak uninstall --unused -y --user"
             else
-                echo -e "\033[0;90mSkipped\033[0m"
-            fi
-        else
-            echo -e "\033[0;90mSkipped\033[0m"
-        fi
-    fi
-}
-
-## ==================== ##
-## Category Groupings    ##
-## ==================== ##
-
-## Container Functs ##
-
-_mc_confuncts() {
-    _mc_snapdata
-
-    _mc_flatdata
-
-    _mc_dockerclean
-
-    _mc_podmanclean
-}
-
-## Developer Functs ##
-
-_mc_devfuncts() {
-    _mc_gocache
-
-    _mc_javacache
-
-    _mc_corepack
-
-    _mc_npmcache
-
-    _mc_yarncache
-
-    _mc_pnpmcache
-
-    _mc_rustcargo
-
-    _mc_rustup
-
-    _mc_rubygems
-
-    _mc_pipcache
-
-    _mc_pycache
-
-    _mc_gradlecache
-
-    _mc_mavencache
-
-    _mc_ccachecache
-}
-
-## Pacman Functs ##
-
-_mc_pacmanfuncts() {
-    ## Check for pacman before operations below ##
-    if command -v pacman >/dev/null 2>&1; then
-
-        _mc_aurhelpers
-
-        _mc_pacmanunused
-
-        _mc_pacmancache
-
-        _mc_orphans
-
-        _mc_pacmancrumbs
-
-    fi
-}
-
-## ==================== ##
-## Option Processing     ##
-## ==================== ##
-
-## Default All ##
-
-if [[ "$#" == 0 ]]; then
-    set -- -bcdp
-elif [[ "$#" -eq 1 && "$1" == "-n" ]]; then
-    set -- -nbcdp
-fi
-
-## Dry Run Banner ##
-
-if [[ $_mc_dry_run -eq 1 ]]; then
-    echo -e "\n\033[0;33m[DRY RUN] Simulating cleanings — nothing will be modified or deleted."
-    echo -e "Sizes shown are estimates (upper bounds).\033[0m"
-fi
-
-## Process Options ##
-
-while getopts ":abcdjphn" option; do
-    case $option in
-        a) # automatic mode
-            if [[ $_mc_dry_run -eq 1 ]]; then
-                echo -e "\nError: -a (auto) and -n (dry-run) cannot be combined. Use -n alone."
-                exit 1
-            fi
-            sudo -k
-            echo -e "\nPerforming all cleanings automatically."
-            echo -e "\nThis is the final warning.\n"
-            if sudo -p "To continue enter the password for %p (ctrl+c to cancel): " true; then
                 echo ""
-                yes | $0 ;
-            fi
-            exit ;;
-        b) # clean basics
-            _mc_section "Basic Cleanup"
-            _mc_junker
-            _mc_trash
-            _mc_homecache
-            _mc_thumbcache
-            _mc_mesashader
-            _mc_crashdumps
-            _mc_xsessionerrs
-            _mc_journlogs
-            _mc_rotatedlogs
-            _mc_coredumps
-            _mc_oldvartmp
-            ;;
-        c) # clean containers
-            _mc_section "Containers"
-            _mc_confuncts
-            ;;
-        d) # clean devs
-            _mc_section "Developer Caches"
-            _mc_devfuncts
-            ;;
-        j) # clean junk
-            _mc_section "Junk Directories"
-            _mc_junker
-            ;;
-        p) # clean pkg-related
-            _mc_section "Package Management"
-            _mc_pkgfiledata
-            _mc_packagekitdata
-            _mc_pamacdata
-            _mc_pacmanfuncts
-            ;;
-        n) # dry-run (already processed in pre-scan)
-            ;;
-        h) # display Help
-            _mc_help
-            exit ;;
-        \?) # invalid option
-            echo "Error: Invalid option"
-            _mc_help
-            exit ;;
-    esac
-done
+                flatpak uninstall --unused -y --user 2>/dev/null; or true
+                _ok
+            end
+        else
+            _note "Skipped"
+        end
 
-## Show Total ##
+        if _confirm "Remove unused Flatpak refs (system) (y/N)? "
+            if test $DRY_RUN -eq 1
+                _note "Would run: sudo flatpak uninstall --unused -y --system"
+            else
+                _ensure_sudo
+                echo ""
+                sudo flatpak uninstall --unused -y --system 2>/dev/null; or true
+                _ok
+            end
+        else
+            _note "Skipped"
+        end
 
-_mc_section "Summary"
-_mc_calcttl
+        if _confirm "Remove all unowned Flatpak app data (y/N)? "
+            if test $DRY_RUN -eq 1
+                _note "Would run: flatpak uninstall --delete-data -y"
+            else
+                echo ""
+                flatpak uninstall --delete-data -y 2>/dev/null; or true
+                _ok
+            end
+        else
+            _note "Skipped"
+        end
+    end
 
-## Exit Script ##
+    # Flatpak temp cache dirs in /var/tmp
+    if test -d /var/tmp
+        _ensure_sudo
+        set -l find_cmd
+        if test $DRY_RUN -eq 1
+            set find_cmd find
+        else
+            set find_cmd sudo find
+        end
+        set -l cache_count (command $find_cmd /var/tmp -maxdepth 1 -type d -name 'flatpak-cache-*' $AGE_ARGS 2>/dev/null | wc -l | string trim)
+        if test $cache_count -gt 0
+            set -l cache_bytes (command $find_cmd /var/tmp -maxdepth 1 -type d -name 'flatpak-cache-*' $AGE_ARGS -exec du -sb -- '{}' + 2>/dev/null | awk '{s+=$1} END{printf "%d", s+0}')
+            test -z "$cache_bytes"; and set cache_bytes 0
 
-if [[ $_mc_dry_run -eq 1 ]]; then
-    echo -e "\n\033[0;33m[DRY RUN] No changes were made.\033[0m\n"
+            _print_preview "Flatpak temp cache dirs $AGE_LABEL" $cache_count $cache_bytes
+
+            if _confirm "Delete old Flatpak temp cache dirs (y/N)? "
+                if test $DRY_RUN -eq 1
+                    _note "Would remove old Flatpak temp cache dirs"
+                else
+                    command sudo find /var/tmp -maxdepth 1 -type d -name 'flatpak-cache-*' $AGE_ARGS -exec rm -rf -- '{}' + 2>/dev/null
+                    _ok
+                end
+                _add_total $cache_bytes
+            else
+                _note "Skipped"
+            end
+        end
+    end
+end
+
+function _clean_snap
+    if command -q snap
+        if _confirm "Clean old/disabled SNAP revisions (y/N)? "
+            if test $DRY_RUN -eq 1
+                _note "Would remove disabled snap revisions"
+            else
+                for line in (LANG=C snap list --all 2>/dev/null | awk '/disabled/{print $1, $3}')
+                    set -l parts (string split ' ' $line)
+                    sudo snap remove $parts[1] --revision=$parts[2] 2>/dev/null; or true
+                end
+                _ok
+            end
+        else
+            _note "Skipped"
+        end
+    else if test -d $HOME/.snap; or test -d $HOME/snap; or test -d /var/lib/snapd
+        if _confirm "Clean up ALL leftover SNAP data (snap is not installed) (y/N)? "
+            if test $DRY_RUN -eq 1
+                _note "Would remove leftover snap directories"
+            else
+                sudo rm -rf /var/lib/snapd 2>/dev/null; or true
+                rm -rf $HOME/.snap $HOME/snap 2>/dev/null; or true
+                _ok
+            end
+        else
+            _note "Skipped"
+        end
+    end
+end
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  PACKAGE MANAGEMENT CLEANUP
+# ═══════════════════════════════════════════════════════════════════════════════
+
+function _clean_pkgfile_cache
+    set -l dir /var/cache/pkgfile
+    test -d "$dir"; or return
+    _ensure_sudo
+
+    set -l stats (_count_and_bytes_deep_system "$dir")
+    set -l count $stats[1]
+    set -l bytes $stats[2]
+    test $count -gt 0; or return
+
+    _print_preview "pkgfile cache $AGE_LABEL" $count $bytes
+
+    if _confirm "Delete old pkgfile cache entries (y/N)? "
+        if test $DRY_RUN -eq 1
+            _note "Would clean old pkgfile cache entries"
+        else
+            _remove_old_system_files "$dir"
+            _ok
+        end
+        _add_total $bytes
+    else
+        _note "Skipped"
+    end
+end
+
+function _clean_packagekit_cache
+    set -l dir /var/cache/PackageKit
+    test -d "$dir"; or return
+    _ensure_sudo
+
+    set -l stats (_count_and_bytes_deep_system "$dir")
+    set -l count $stats[1]
+    set -l bytes $stats[2]
+    test $count -gt 0; or return
+
+    _print_preview "PackageKit cache $AGE_LABEL" $count $bytes
+
+    if _confirm "Delete old PackageKit cache entries (y/N)? "
+        if test $DRY_RUN -eq 1
+            _note "Would clean old PackageKit cache entries"
+        else
+            _remove_old_system_files "$dir"
+            _ok
+        end
+        _add_total $bytes
+    else
+        _note "Skipped"
+    end
+end
+
+function _clean_pamac_temp
+    set -l dirs /var/tmp/pamac /var/tmp/pamac-build-$USER
+    _ensure_sudo
+
+    set -l total_count 0
+    set -l total_bytes 0
+    for dir in $dirs
+        test -e "$dir"; or continue
+        set -l stats (_count_and_bytes_deep_system "$dir")
+        set total_count (math "$total_count + $stats[1]")
+        set total_bytes (math "$total_bytes + $stats[2]")
+    end
+    test $total_count -gt 0; or return
+
+    _print_preview "Pamac temp files $AGE_LABEL" $total_count $total_bytes
+
+    if _confirm "Delete old Pamac temp files (y/N)? "
+        if test $DRY_RUN -eq 1
+            _note "Would clean old Pamac temp files"
+        else
+            for dir in $dirs
+                test -e "$dir"; or continue
+                _remove_old_system_files "$dir"
+            end
+            _ok
+        end
+        _add_total $total_bytes
+    else
+        _note "Skipped"
+    end
+end
+
+function _clean_aur_helper_archives
+    set -l helper_dirs \
+        $HOME/.cache/yay \
+        $HOME/.cache/paru \
+        $HOME/.cache/pacaur \
+        $HOME/.cache/pikaur \
+        $HOME/.cache/trizen
+
+    set -l total_count 0
+    set -l total_bytes 0
+
+    set -l name_args \
+        -type f '(' \
+        -name '*.pkg.tar*' -o \
+        -name '*.src.tar*' -o \
+        -name '*.sig' -o \
+        -name '*.log' -o \
+        -name '*.diff' -o \
+        -name '*.patch' \
+        ')' $AGE_ARGS
+
+    for dir in $helper_dirs
+        test -d "$dir"; or continue
+        set -l n (command find "$dir" $name_args 2>/dev/null | wc -l | string trim)
+        set -l b (command find "$dir" $name_args -printf '%s\n' 2>/dev/null | awk '{s+=$1} END{printf "%d", s+0}')
+        test -z "$b"; and set b 0
+        set total_count (math "$total_count + $n")
+        set total_bytes (math "$total_bytes + $b")
+    end
+
+    test $total_count -gt 0; or return
+    _print_preview "AUR helper archive/log cache $AGE_LABEL" $total_count $total_bytes
+
+    if test $LIST_MATCHES -eq 1
+        for dir in $helper_dirs
+            test -d "$dir"; or continue
+            command find "$dir" $name_args -print 2>/dev/null
+        end
+    end
+
+    if _confirm "Delete old AUR helper archive/log files (y/N)? "
+        if test $DRY_RUN -eq 1
+            _note "Would remove old AUR helper archive/log files"
+        else
+            for dir in $helper_dirs
+                test -d "$dir"; or continue
+                command find "$dir" $name_args -delete 2>/dev/null
+            end
+            _ok
+        end
+        _add_total $total_bytes
+    else
+        _note "Skipped"
+    end
+end
+
+function _clean_pacman_cache
+    set -g TOOL_WORK 1
+    command -q paccache; or begin
+        _warn "Skipping pacman cache pruning (paccache not installed — install pacman-contrib)."
+        return
+    end
+
+    # Build paccache age arg (omitted when --no-age)
+    set -l pac_age_label
+    if test $NO_AGE -eq 1
+        set pac_age_label "all ages"
+    else
+        set pac_age_label "$AGE_LABEL"
+    end
+
+    if _confirm "Prune installed package cache (keep $KEEP_VERSIONS versions, $pac_age_label) (y/N)? "
+        if test $DRY_RUN -eq 1
+            if test $NO_AGE -eq 1
+                _note "Would run: sudo paccache -rvk$KEEP_VERSIONS"
+                _note "Preview candidates:"
+                command paccache -dvk$KEEP_VERSIONS 2>/dev/null; or _note "  preview unavailable"
+            else
+                _note "Would run: sudo paccache -rvk$KEEP_VERSIONS --min-mtime '$AGE_DAYS days ago'"
+                _note "Preview candidates:"
+                command paccache -dvk$KEEP_VERSIONS --min-mtime "$AGE_DAYS days ago" 2>/dev/null; or _note "  preview unavailable"
+            end
+        else
+            _ensure_sudo
+            echo ""
+            if test $NO_AGE -eq 1
+                command sudo paccache -rvk$KEEP_VERSIONS
+            else
+                command sudo paccache -rvk$KEEP_VERSIONS --min-mtime "$AGE_DAYS days ago"
+            end
+            _ok
+        end
+    else
+        _note "Skipped"
+    end
+
+    if _confirm "Prune uninstalled package cache ($pac_age_label) (y/N)? "
+        if test $DRY_RUN -eq 1
+            if test $NO_AGE -eq 1
+                _note "Would run: sudo paccache -rvuk0"
+            else
+                _note "Would run: sudo paccache -rvuk0 --min-mtime '$AGE_DAYS days ago'"
+            end
+        else
+            _ensure_sudo
+            echo ""
+            if test $NO_AGE -eq 1
+                command sudo paccache -rvuk0
+            else
+                command sudo paccache -rvuk0 --min-mtime "$AGE_DAYS days ago"
+            end
+            _ok
+        end
+    else
+        _note "Skipped"
+    end
+end
+
+function _clean_pacman_interrupted
+    set -l dir /var/cache/pacman/pkg
+    test -d "$dir"; or return
+    _ensure_sudo
+
+    set -l find_cmd
+    if test $DRY_RUN -eq 1
+        set find_cmd find
+    else
+        set find_cmd sudo find
+    end
+    set -l count (command $find_cmd "$dir" -maxdepth 1 -type d -name 'download-*' $AGE_ARGS 2>/dev/null | wc -l | string trim)
+    test $count -gt 0; or return
+    set -l bytes (command $find_cmd "$dir" -maxdepth 1 -type d -name 'download-*' $AGE_ARGS -exec du -sb -- '{}' + 2>/dev/null | awk '{s+=$1} END{printf "%d", s+0}')
+    test -z "$bytes"; and set bytes 0
+
+    _print_preview "Pacman interrupted downloads $AGE_LABEL" $count $bytes
+
+    if _confirm "Delete old pacman interrupted-download directories (y/N)? "
+        if test $DRY_RUN -eq 1
+            _note "Would remove old pacman interrupted-download directories"
+        else
+            command sudo find "$dir" -maxdepth 1 -type d -name 'download-*' $AGE_ARGS -exec rm -rf -- '{}' + 2>/dev/null
+            _ok
+        end
+        _add_total $bytes
+    else
+        _note "Skipped"
+    end
+end
+
+function _clean_orphans
+    set -g TOOL_WORK 1
+    command -q pacman; or return
+
+    set -l orphans (pacman -Qdtq 2>/dev/null)
+    test (count $orphans) -gt 0; or return
+
+    _note "Orphan package removal is not age-based. Review carefully."
+    echo "$C_BOLD""Orphan packages found:$C_RESET"
+    for pkg in $orphans
+        echo "  $pkg"
+    end
+
+    set -l total_size 0
+    for pkg in $orphans
+        set -l info (pacman -Qi -- $pkg 2>/dev/null)
+        for line in $info
+            if string match -q 'Installed Size*' $line
+                set -l size (echo $line | awk '{print $4}')
+                set -l unit (echo $line | awk '{print $5}')
+                switch $unit
+                    case KiB
+                        set total_size (math "$total_size + "(math --scale=0 "$size * 1024"))
+                    case MiB
+                        set total_size (math "$total_size + "(math --scale=0 "$size * 1048576"))
+                    case GiB
+                        set total_size (math "$total_size + "(math --scale=0 "$size * 1073741824"))
+                end
+            end
+        end
+    end
+
+    _print_preview "Orphan packages" (count $orphans) $total_size
+
+    if _confirm "Remove all orphan packages shown above (y/N)? "
+        if test $DRY_RUN -eq 1
+            _note "Would remove the orphan packages listed above"
+        else
+            _ensure_sudo
+            echo ""
+            sudo pacman -Rns --noconfirm -- $orphans
+            _ok
+        end
+    else
+        _note "Skipped"
+    end
+end
+
+function _clean_pacnew_pacsave
+    command -q pacdiff; or return
+    set -l files (pacdiff -o 2>/dev/null)
+    test (count $files) -gt 0; or return
+
+    echo ""
+    _warn "Attention! Manual intervention required for the following pacnew/pacsave files:"
+    for f in $files
+        echo "  $f"
+    end
+    _note "Run 'sudo pacdiff' to review and merge these files."
+end
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  HELP TEXT
+# ═══════════════════════════════════════════════════════════════════════════════
+
+function _show_help
+    echo ""
+    echo "$C_BOLD$SCRIPT_NAME $SCRIPT_VERSION$C_RESET — Safe system cleaner for CachyOS"
+    echo ""
+    echo "Cleans only re-creatable caches, temp files, and broken links."
+    echo "Everything is explained before it happens. Nothing runs without"
+    echo "your approval (unless you use --auto). Dry run is fully supported."
+    echo ""
+    echo "$C_BOLD""Usage:$C_RESET cachycleaner.fish [options]"
+    echo ""
+    echo "$C_BOLD""Options:$C_RESET"
+    echo "  -h, --help          Show this help"
+    echo "  -n, --dry-run       Simulate only — nothing is deleted"
+    echo "  -b, --basic         Run basic cleanup section"
+    echo "  -p, --packages      Run package management cleanup"
+    echo "  -c, --containers    Run container cleanup (Flatpak/Snap)"
+    echo "  -j, --junk          Run custom junk directory cleanup"
+    echo "  -d, --developers    Run developer cache cleanup"
+    echo "  -k, --broken        Find and remove broken symlinks in \$HOME"
+    echo "  -l, --list          List matched paths before each prompt"
+    echo "  -a, --auto          Auto-confirm all prompts (not with --dry-run)"
+    echo "  -g, --aggressive    Aggressive mode (GPU caches, Steam shaders)"
+    echo "  -r, --report        Report only (sizes listed, no prompts/deletions)"
+    echo "  --no-age, --nuke    Remove age filter — clean ALL eligible files"
+    echo "  --paste             Upload output to paste.cachyos.org and print link"
+    echo "  --all               Run every section"
+    echo ""
+    echo "$C_BOLD""Defaults:$C_RESET"
+    echo "  No options       => --basic --packages --containers"
+    echo "  Only --dry-run   => dry run of --basic --packages --containers"
+    echo "  Developer & broken-link scans are opt-in"
+    echo ""
+    echo "$C_BOLD""Config:$C_RESET $CONFIG_FILE"
+    echo ""
+    echo "$C_BOLD""Examples:$C_RESET"
+    echo "  cachycleaner.fish --dry-run --list          # preview with file listing"
+    echo "  cachycleaner.fish -d -n                     # preview developer caches"
+    echo "  cachycleaner.fish --all --dry-run            # preview everything"
+    echo "  cachycleaner.fish -r                         # report sizes only"
+    echo "  cachycleaner.fish -k                         # find broken symlinks"
+    echo "  cachycleaner.fish --no-age --dry-run --list  # preview full clean (no age limit)"
+    echo "  cachycleaner.fish --nuke --all               # deep clean everything"
+    echo "  cachycleaner.fish -r --paste                 # report sizes and share via paste"
+    echo "  cachycleaner.fish --dry-run --paste           # dry-run and upload results"
+    echo ""
+end
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  OPTION PARSING
+# ═══════════════════════════════════════════════════════════════════════════════
+
+set -l has_section 0
+
+for arg in $argv
+    switch $arg
+        case -h --help
+            _show_help
+            exit 0
+        case -n --dry-run
+            set -g DRY_RUN 1
+        case -b --basic
+            set -g RUN_BASIC 1
+            set has_section 1
+        case -p --packages
+            set -g RUN_PACKAGES 1
+            set has_section 1
+        case -c --containers
+            set -g RUN_CONTAINERS 1
+            set has_section 1
+        case -j --junk
+            set -g RUN_JUNK 1
+            set has_section 1
+        case -d --developers
+            set -g RUN_DEVELOPERS 1
+            set has_section 1
+        case -k --broken
+            set -g RUN_BROKEN 1
+            set has_section 1
+        case -l --list
+            set -g LIST_MATCHES 1
+        case -a --auto
+            set -g AUTO_YES 1
+        case -g --aggressive
+            set -g AGGRESSIVE 1
+        case -r --report
+            set -g REPORT_ONLY 1
+        case --no-age --nuke
+            set -g NO_AGE 1
+        case --paste
+            set -g PASTE_OUTPUT 1
+        case --all
+            set -g RUN_BASIC 1
+            set -g RUN_PACKAGES 1
+            set -g RUN_CONTAINERS 1
+            set -g RUN_JUNK 1
+            set -g RUN_DEVELOPERS 1
+            set -g RUN_BROKEN 1
+            set has_section 1
+        case '*'
+            _error "Unknown option: $arg"
+            _show_help
+            exit 1
+    end
+end
+
+# Default sections if none specified
+if test $has_section -eq 0
+    set -g RUN_BASIC 1
+    set -g RUN_CONTAINERS 1
+    set -g RUN_PACKAGES 1
+end
+
+# Report mode implies dry-run and no listing
+if test $REPORT_ONLY -eq 1
+    set -g DRY_RUN 1
+    set -g LIST_MATCHES 0
+end
+
+# Cannot combine auto + dry-run
+if test $AUTO_YES -eq 1 -a $DRY_RUN -eq 1
+    _error "Cannot combine --auto and --dry-run."
+    exit 1
+end
+
+# --no-age: override age threshold to 0 (match everything)
+if test $NO_AGE -eq 1
+    set -g AGE_DAYS 0
+    set -g AGE_ARGS
+    set -g AGE_LABEL "(all ages)"
 else
-    echo -ne "\nPress any key to exit."
-    read -t60 -s -n1
-    echo -e "\n"
-fi
-exit 0
+    set -g AGE_ARGS -mtime +$AGE_DAYS
+    set -g AGE_LABEL "older than $AGE_DAYS days"
+end
+
+# --paste: validate paste-cachyos and curl are available, set up log file
+# --paste: validate curl is available
+if test $PASTE_OUTPUT -eq 1
+    if not command -q curl
+        _error "Cannot use --paste: curl is not installed."
+        exit 1
+    end
+end
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  PASTE HELPER — wraps the entire run to capture output for paste.cachyos.org
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# If --paste is active and we are NOT already inside the tee wrapper,
+# re-exec ourselves through tee so everything (stdout + stderr) is captured.
+# The tee'd copy goes to a temp file, then gets ANSI-stripped and uploaded.
+if test $PASTE_OUTPUT -eq 1 -a -z "$_CACHYCLEANER_INSIDE_TEE"
+    set -gx _CACHYCLEANER_INSIDE_TEE 1
+    set -l raw_log (mktemp /tmp/cachycleaner-paste-XXXXXX.raw)
+
+    # Re-run with tee capturing everything (colours stay on terminal)
+    fish (status filename) $argv 2>&1 | tee $raw_log
+    set -l run_exit $pipestatus[1]
+
+    # Strip ANSI escape codes for a clean paste
+    sed 's/\x1b\[[0-9;]*m//g' $raw_log >$raw_log.clean
+
+    # Upload to paste.cachyos.org
+    set -l paste_url "https://paste.cachyos.org"
+    set -l response (curl -s --data-binary @$raw_log.clean --url $paste_url 2>/dev/null)
+    if test -n "$response"
+        echo ""
+        echo (set_color --bold cyan)"Paste uploaded: $paste_url$response.txt"(set_color normal)
+    else
+        echo ""
+        echo (set_color red)"Failed to upload paste (no response from $paste_url)."(set_color normal)
+    end
+
+    # Clean up temp files
+    rm -f $raw_log $raw_log.clean 2>/dev/null
+    exit $run_exit
+end
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  BANNER
+# ═══════════════════════════════════════════════════════════════════════════════
+
+echo ""
+echo "$C_BOLD$SCRIPT_NAME $SCRIPT_VERSION$C_RESET"
+if set -q _warn_config_migration
+    _warn "$_warn_config_migration"
+end
+if test $NO_AGE -eq 1
+    _warn "Age filter: DISABLED — all eligible files will be matched regardless of age"
+    if test $DRY_RUN -eq 0 -a $REPORT_ONLY -eq 0
+        _warn "This is destructive! Consider running with --dry-run first."
+        echo ""
+        read -P "$C_YELLOW""Continue without age filter? (type YES to confirm): $C_RESET" _nuke_confirm
+        if test "$_nuke_confirm" != "YES"
+            echo "Aborted."
+            exit 0
+        end
+    end
+else
+    _note "Age threshold: files $AGE_LABEL"
+end
+if test $AGGRESSIVE -eq 1
+    _note "Mode: aggressive"
+else
+    _note "Mode: normal"
+end
+_note "Personal folders (Downloads/Documents/Desktop/...) are never targeted."
+
+if test $REPORT_ONLY -eq 1
+    _warn "[REPORT ONLY] No prompts, no deletions."
+else if test $DRY_RUN -eq 1
+    _warn "[DRY RUN] Nothing will be deleted."
+end
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  RUN SELECTED SECTIONS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_report_top_space_hogs
+
+if test $RUN_JUNK -eq 1
+    _section "Custom Junk Directories"
+    _clean_custom_junk
+end
+
+if test $RUN_BASIC -eq 1
+    _section "Basic Cleanup"
+    _clean_trash
+    _clean_thumbnails
+    _clean_generic_home_cache
+    _clean_mesa_shader_cache
+    _clean_appimage_leftovers
+    if test $AGGRESSIVE -eq 1
+        _clean_steam_shader_cache
+        _clean_electron_gpu_caches
+    end
+    _clean_crash_dumps
+    _clean_xsession_errors
+    _clean_journal_logs
+    _clean_rotated_logs
+    _clean_coredumps
+    _clean_var_tmp
+end
+
+if test $RUN_DEVELOPERS -eq 1
+    _section "Developer Caches"
+    _note "This section targets re-creatable developer caches, not your projects or source trees."
+    _clean_go_cache
+    _clean_java_cache
+    _clean_corepack_cache
+    _clean_python_bytecode
+    _clean_npm_cache
+    _clean_yarn_cache
+    _clean_pnpm_cache
+    _clean_cargo_cache
+    _clean_pip_cache
+end
+
+if test $RUN_CONTAINERS -eq 1
+    _section "Containers"
+    _clean_flatpak
+    _clean_snap
+end
+
+if test $RUN_PACKAGES -eq 1
+    _section "Package Management"
+    _clean_pkgfile_cache
+    _clean_packagekit_cache
+    _clean_pamac_temp
+    _clean_aur_helper_archives
+    _clean_pacman_cache
+    _clean_pacman_interrupted
+    _clean_orphans
+    _clean_pacnew_pacsave
+end
+
+if test $RUN_BROKEN -eq 1
+    _section "Broken Symlinks (Deep Scan)"
+    _clean_broken_symlinks
+end
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  SUMMARY
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_print_ranked_report
+
+_section "Summary"
+
+if test $DRY_RUN -eq 1
+    printf 'Direct-file cleanup would free about: %s\n' (_human_bytes $TOTAL_BYTES)
+else
+    printf 'Direct-file cleanup freed about: %s\n' (_human_bytes $TOTAL_BYTES)
+end
+
+if test $TOOL_WORK -eq 1
+    _note "Some tool-driven actions (paccache / journalctl / flatpak / pacman orphans) report their own effect and are not included in the total above."
+end
+
+if test $REPORT_ONLY -eq 1
+    _warn "[REPORT ONLY] No changes were made."
+else if test $DRY_RUN -eq 1
+    _warn "[DRY RUN] No changes were made."
+end
+
+echo ""
+exit $EXIT_CODE
